@@ -203,6 +203,10 @@ class AISupport(commands.Cog):
         await self._schedule_initial_auto_reply(thread, creator, initial_message)
 
     @commands.Cog.listener()
+    async def on_thread_message(self, thread, message):
+        await self._schedule_user_ai_reply(thread, message)
+
+    @commands.Cog.listener()
     async def on_thread_reply(self, thread, from_mod, message, anonymous, plain):
         thread_id = getattr(thread, "id", None)
         if thread_id is None:
