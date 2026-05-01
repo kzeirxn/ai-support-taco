@@ -18,17 +18,34 @@ import discord
 from discord.ext import commands
 
 
-SYSTEM_PROMPT = """You are a helpful support assistant for this Discord server.
+BASE_SYSTEM_PROMPT = """You are a helpful AI support assistant for the Taco Support dashboard.
 A user has opened a support ticket and no staff member has claimed it yet.
 Your job is to:
 1. Greet the user warmly and acknowledge their issue.
-2. Try your best to resolve their issue using general knowledge.
-3. Let them know that a staff member will be with them if you cannot fully help.
+2. Use the knowledge base below to try to resolve their issue accurately.
+3. If unsure, ask a clarifying question — do NOT guess or make up answers.
+4. Let them know a staff member will follow up if you cannot fully resolve it.
 
 Keep your replies concise, friendly, and professional.
 Do NOT pretend to be a human staff member — you are an AI assistant.
-If the user's issue requires account-specific or server-specific action only staff can do, say so clearly.
+If the issue requires account-specific action only staff can perform, say so clearly.
+
+--- KNOWLEDGE BASE ---
+{knowledge}
+--- END KNOWLEDGE BASE ---
 """
+
+KNOWLEDGE_FILE = os.path.join(os.path.dirname(__file__), "support_knowledge")
+
+
+def _load_system_prompt() -> str:
+    """Load support_knowledge file and inject into the system prompt."""
+    try:
+        with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+            knowledge = f.read().strip()
+    except FileNotFoundError:
+        knowledge = "(No knowledge base found — answer using general knowledge only.)"
+    return BASE_SYSTEM_PROMPT.format(knowledge=knowledge)
 
 
 class AIAssistant(commands.Cog):
@@ -151,7 +168,7 @@ class AIAssistant(commands.Cog):
         url = f"{self.ollama_url.rstrip('/')}/api/chat"
         payload = {
             "model": self.ollama_model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            "messages": [{"role": "system", "content": _load_system_prompt()}] + messages,
             "stream": False,
         }
 
