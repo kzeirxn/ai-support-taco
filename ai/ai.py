@@ -205,10 +205,13 @@ class AISupport(commands.Cog):
         if message.guild is not None:
             return
 
-        thread = await self.bot.threads.find(recipient=message.author)
-        if thread is None:
-            await asyncio.sleep(1)
+        thread = None
+        for _ in range(6):
             thread = await self.bot.threads.find(recipient=message.author)
+            if thread is not None:
+                break
+            await asyncio.sleep(0.5)
+
         if thread is None:
             return
 
