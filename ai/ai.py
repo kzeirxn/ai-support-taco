@@ -11,6 +11,8 @@ Setup:
   Set OLLAMA_MODEL in your bot's .env or config (default: llama3)
 """
 
+import os
+
 import aiohttp
 import discord
 from discord.ext import commands
@@ -34,8 +36,8 @@ class AIAssistant(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.ollama_url = bot.config.get("OLLAMA_URL") or "https://ai.tacogroup.uk"
-        self.ollama_model = bot.config.get("OLLAMA_MODEL") or "llama3"
+        self.ollama_url = os.environ.get("OLLAMA_URL", "https://ai.tacogroup.uk")
+        self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3")
         # Tracks active AI sessions: thread channel_id -> list of message dicts
         self.active_threads: dict[int, list[dict]] = {}
         # Tracks claimed threads so AI stops responding
