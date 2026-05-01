@@ -59,7 +59,7 @@ class AIAssistant(commands.Cog):
             if initial_message and initial_message.content
             else "Hello, I need some help."
         )
-        await self._reply_as_ai(thread.channel, user_text)
+        await self._reply_as_ai(thread, user_text)
 
     @commands.Cog.listener()
     async def on_thread_close(self, thread, closer, silent, delete_channel, message, scheduled):
@@ -88,24 +88,26 @@ class AIAssistant(commands.Cog):
         if channel_id in self.claimed_threads:
             return
 
-        # Ignore messages from staff in the thread channel (mods replying)
-        # Modmail posts mod replies as webhooks/bot messages, so real human
-        # messages in the *thread channel* are mods — claim the thread.
-        if message.guild and message.channel.guild == message.guild:
-            # A real (non-bot) human typed in the mod-side thread channel
+        # If the message is in a guild channel (staff side), a mod just typed — claim it
+        if message.guild:
             self.claimed_threads.add(channel_id)
             self.active_threads.pop(channel_id, None)
             return
 
-        # User message coming through — get AI response
-        await self._reply_as_ai(message.channel, message.content)
+        # Message is a DM from the user — look up the thread and reply
+        thread = self.bot.threads.find_by_recipient(message.author)
+        if thread is None:
+            return
+
+        await self._reply_as_ai(thread, message.content)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _reply_as_ai(self, channel: discord.TextChannel, user_message: str):
-        """Build conversation history, call Ollama, send reply."""
+    async def _reply_as_ai(self, thread, user_message: str):
+        """Build conversation history, call Ollama, DM the user, and post a staff note."""
+        channel = thread.channel
         channel_id = channel.id
         history = self.active_threads.get(channel_id, [])
 
@@ -115,18 +117,34 @@ class AIAssistant(commands.Cog):
         async with channel.typing():
             ai_reply = await self._call_ollama(history)
 
-        if ai_reply:
-            # Append AI reply to history for multi-turn context
-            history.append({"role": "assistant", "content": ai_reply})
-            self.active_threads[channel_id] = history
+        if not ai_reply:
+            return
 
-            embed = discord.Embed(
-                description=ai_reply,
-                color=discord.Color.blurple(),
-            )
-            embed.set_author(name="🤖 AI Assistant (virtual support)")
-            embed.set_footer(text="A staff member will be with you shortly if needed.")
-            await channel.send(embed=embed)
+        # Append AI reply to history for multi-turn context
+        history.append({"role": "assistant", "content": ai_reply})
+        self.active_threads[channel_id] = history
+
+        # 1. Send the reply to the user's DMs directly
+        user_embed = discord.Embed(
+            description=ai_reply,
+            color=discord.Color.blurple(),
+        )
+        user_embed.set_author(name="🤖 AI Assistant")
+        user_embed.set_footer(text="A staff member will be with you shortly if needed.")
+
+        try:
+            await thread.recipient.send(embed=user_embed)
+        except discord.Forbidden:
+            await channel.send("⚠️ Could not DM the user (DMs may be disabled).")
+            return
+
+        # 2. Post a visible note in the staff thread channel so mods can see what was said
+        staff_embed = discord.Embed(
+            description=f"**AI replied to user:**\n{ai_reply}",
+            color=discord.Color.blurple(),
+        )
+        staff_embed.set_author(name="🤖 AI Assistant — sent to user")
+        await channel.send(embed=staff_embed)
 
     async def _call_ollama(self, messages: list[dict]) -> str | None:
         """Send a chat request to the Ollama API and return the response text."""
