@@ -37,6 +37,15 @@ If the issue requires account-specific action only staff can perform, say so cle
 
 KNOWLEDGE_FILE = os.path.join(os.path.dirname(__file__), "support_knowledge")
 
+SENTIMENT_PROMPT = """You are a sentiment classifier. Analyse the user message below and respond with ONLY one word:
+- NEGATIVE  (user is angry, frustrated, upset, threatening, or using strong negative language)
+- NEUTRAL   (user is calm, asking a question, or making a normal request)
+- POSITIVE  (user is happy, grateful, or clearly satisfied)
+
+Respond with ONLY the single word. No punctuation, no explanation.
+
+Message: {message}"""
+
 
 def _load_system_prompt() -> str:
     """Load support_knowledge file and inject into the system prompt."""
@@ -55,6 +64,8 @@ class AIAssistant(commands.Cog):
         self.bot = bot
         self.ollama_url = os.environ.get("OLLAMA_URL", "https://ai.tacogroup.uk")
         self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3")
+        # Role ID to ping when escalating (set ESCALATION_ROLE_ID in .env)
+        self.escalation_role_id: int | None = int(r) if (r := os.environ.get("ESCALATION_ROLE_ID")) else 1401301393767141541
         # Tracks active AI sessions: thread channel_id -> list of message dicts
         self.active_threads: dict[int, list[dict]] = {}
         # Tracks claimed threads so AI stops responding
@@ -141,6 +152,13 @@ class AIAssistant(commands.Cog):
         channel_id = channel.id
         history = self.active_threads.get(channel_id, [])
 
+        # --- Sentiment check before replying ---
+        sentiment = await self._check_sentiment(user_message)
+        print(f"[ai_assistant] Sentiment for channel {channel_id}: {sentiment}")
+        if sentiment == "NEGATIVE":
+            await self._escalate(thread, user_message)
+            return
+
         # Append the new user message to history
         history.append({"role": "user", "content": user_message})
 
@@ -175,6 +193,66 @@ class AIAssistant(commands.Cog):
         )
         staff_embed.set_author(name="🤖 AI Assistant — sent to user")
         await channel.send(embed=staff_embed)
+
+    async def _check_sentiment(self, message: str) -> str:
+        """Ask Ollama to classify sentiment. Returns NEGATIVE, NEUTRAL, or POSITIVE."""
+        url = f"{self.ollama_url.rstrip('/')}/api/chat"
+        payload = {
+            "model": self.ollama_model,
+            "messages": [
+                {"role": "user", "content": SENTIMENT_PROMPT.format(message=message)}
+            ],
+            "stream": False,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status != 200:
+                        return "NEUTRAL"
+                    data = await resp.json(content_type=None)
+                    result = data.get("message", {}).get("content", "").strip().upper()
+                    if "NEGATIVE" in result:
+                        return "NEGATIVE"
+                    if "POSITIVE" in result:
+                        return "POSITIVE"
+                    return "NEUTRAL"
+        except Exception as exc:
+            print(f"[ai_assistant] Sentiment check failed ({type(exc).__name__}): {exc}")
+            return "NEUTRAL"  # Fail safe — don't block the AI on error
+
+    async def _escalate(self, thread, trigger_message: str):
+        """Silence the AI and alert staff that a frustrated user needs attention."""
+        channel = thread.channel
+        channel_id = channel.id
+
+        # Silence AI for this thread
+        self.claimed_threads.add(channel_id)
+        self.active_threads.pop(channel_id, None)
+        self.user_to_channel.pop(thread.recipient.id, None)
+
+        # Build staff alert
+        ping = f"<@&{self.escalation_role_id}> " if self.escalation_role_id else ""
+        staff_embed = discord.Embed(
+            title="⚠️ Sentiment escalation",
+            description=(
+                f"The AI detected frustration or anger in this ticket and has stood down.\n\n"
+                f"**Last user message:**\n{trigger_message[:500]}"
+            ),
+            color=discord.Color.red(),
+        )
+        staff_embed.set_footer(text="AI assistant has been silenced for this thread.")
+        await channel.send(content=ping or None, embed=staff_embed)
+
+        # Let the user know a human is on the way
+        user_embed = discord.Embed(
+            description="I've flagged this conversation for a staff member who will be with you shortly. Sorry for any frustration!",
+            color=discord.Color.orange(),
+        )
+        user_embed.set_author(name="🤖 AI Assistant")
+        try:
+            await thread.recipient.send(embed=user_embed)
+        except discord.Forbidden:
+            pass
 
     async def _call_ollama(self, messages: list[dict]) -> str | None:
         """Send a chat request to the Ollama API and return the response text."""
