@@ -124,8 +124,8 @@ class AIAssistant(commands.Cog):
         if channel_id in self.claimed_threads:
             return
 
-        # Look up the live thread object and reply
-        thread = self.bot.threads.find_by_id(message.author.id)
+        # Look up the live thread object directly from the cache (keyed by user ID)
+        thread = self.bot.threads.cache.get(message.author.id)
         if thread is None:
             return
 
