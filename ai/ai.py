@@ -1,13 +1,12 @@
 import os
 import asyncio
-import json
 from datetime import datetime, timezone
 
 import aiohttp
 from discord.ext import commands
 
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ai.tacogroup.uk")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").lower() == "true"
@@ -17,6 +16,11 @@ AUTO_REPLY_DISCLOSE = os.getenv("AUTO_REPLY_DISCLOSE", "true").lower() == "true"
 
 SUGGEST_ENABLED = os.getenv("SUGGEST_ENABLED", "true").lower() == "true"
 SUGGEST_MAX_CHARS = int(os.getenv("SUGGEST_MAX_CHARS", "900"))
+
+KNOWLEDGE_PATH = os.getenv(
+    "KNOWLEDGE_PATH",
+    os.path.join(os.path.dirname(__file__), "support_knowledge.md"),
+)
 
 
 def _shorten(text, limit):
@@ -30,6 +34,17 @@ class AISupport(commands.Cog):
         self.bot = bot
         self.coll = bot.api.get_plugin_partition(self)
         self._pending = {}  # thread_id -> task
+        self.knowledge = self._load_knowledge()
+
+    def _load_knowledge(self):
+        try:
+            with open(KNOWLEDGE_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                return content
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            return ""
 
     async def _ollama_generate(self, prompt, system):
         payload = {
@@ -44,12 +59,23 @@ class AISupport(commands.Cog):
                 data = await resp.json()
                 return data.get("response", "").strip()
 
+    def _system_with_knowledge(self, base_system):
+        if not self.knowledge:
+            return base_system
+        return (
+            base_system
+            + "\n\nYou have access to internal dashboard knowledge. "
+            + "Use it to answer questions accurately. "
+            + "If something is not covered, say you’re unsure and ask a clarifying question.\n\n"
+            + "=== SUPPORT KNOWLEDGE ===\n"
+            + self.knowledge
+            + "\n=== END KNOWLEDGE ==="
+        )
+
     async def _send_to_thread(self, thread, content):
-        # Prefer thread.reply if available
         if hasattr(thread, "reply"):
             return await thread.reply(content)
 
-        # Fallback to channel.send
         channel = getattr(thread, "channel", None)
         if channel:
             return await channel.send(content)
@@ -67,7 +93,6 @@ class AISupport(commands.Cog):
         if thread_id is None:
             return
 
-        # cancel any existing task
         existing = self._pending.get(thread_id)
         if existing:
             existing.cancel()
@@ -76,7 +101,6 @@ class AISupport(commands.Cog):
             try:
                 await asyncio.sleep(AUTO_REPLY_DELAY_SEC)
 
-                # If staff replied since, skip
                 doc = await self.coll.find_one({"_id": f"thread:{thread_id}"})
                 if doc and doc.get("staff_replied"):
                     return
@@ -84,11 +108,12 @@ class AISupport(commands.Cog):
                 user_text = getattr(initial_message, "content", "")
                 user_text = _shorten(user_text or "", 1200)
 
-                system = (
+                base_system = (
                     "You are a support assistant for a Discord server. "
                     "Be concise, polite, and helpful. Ask one clarifying question if needed. "
                     "Do not promise anything or claim to be a human."
                 )
+                system = self._system_with_knowledge(base_system)
 
                 if AUTO_REPLY_DISCLOSE:
                     prefix = "Thanks for reaching out! I'm an automated assistant while a staff member is away. "
@@ -125,14 +150,12 @@ class AISupport(commands.Cog):
         if thread_id is None:
             return
 
-        # mark staff replied
         if from_mod:
             await self.coll.update_one(
                 {"_id": f"thread:{thread_id}"},
                 {"$set": {"staff_replied": True, "staff_replied_at": datetime.now(timezone.utc)}},
                 upsert=True,
             )
-            # cancel pending auto reply
             task = self._pending.pop(thread_id, None)
             if task:
                 task.cancel()
@@ -141,15 +164,15 @@ class AISupport(commands.Cog):
         if not SUGGEST_ENABLED:
             return
 
-        # Draft suggestion in staff channel
         user_text = getattr(message, "content", "")
         if not user_text:
             return
 
-        system = (
+        base_system = (
             "You are an assistant that drafts responses for staff. "
             "Return a short, professional reply. Do not mention AI."
         )
+        system = self._system_with_knowledge(base_system)
 
         prompt = (
             f"User message:\n{user_text}\n\n"
@@ -169,10 +192,12 @@ class AISupport(commands.Cog):
         if not SUGGEST_ENABLED:
             return await ctx.send("AI drafts are disabled.")
 
-        system = (
+        base_system = (
             "You are an assistant that drafts responses for staff. "
             "Return a short, professional reply. Do not mention AI."
         )
+        system = self._system_with_knowledge(base_system)
+
         prompt = f"User message:\n{message}\n\nDraft a helpful reply for staff to send."
         try:
             draft = await self._ollama_generate(prompt, system)
@@ -180,6 +205,15 @@ class AISupport(commands.Cog):
             await ctx.send(f"**AI draft (not sent):**\n{draft}")
         except Exception as e:
             await ctx.send(f"[AI draft failed] {e}")
+
+    @commands.command()
+    async def ai_reload_knowledge(self, ctx):
+        """Staff command: ?ai_reload_knowledge — reloads support_knowledge.md."""
+        self.knowledge = self._load_knowledge()
+        if self.knowledge:
+            await ctx.send("Reloaded AI knowledge.")
+        else:
+            await ctx.send("Knowledge file missing or empty.")
 
 
 async def setup(bot):
