@@ -1,304 +1,176 @@
-import os
-import asyncio
-from datetime import datetime, timezone
+"""
+ai_assistant - Modmail Plugin
+==============================
+A virtual AI assistant powered by Ollama that automatically replies to users
+while a ticket is unclaimed, attempting to resolve issues before a mod steps in.
+
+When a mod claims the thread, the AI stops responding immediately.
+
+Setup:
+  Set OLLAMA_URL in your bot's .env or config (default: https://ai.tacogroup.uk)
+  Set OLLAMA_MODEL in your bot's .env or config (default: llama3)
+"""
 
 import aiohttp
+import discord
 from discord.ext import commands
 
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ai.tacogroup.uk")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+SYSTEM_PROMPT = """You are a helpful support assistant for this Discord server.
+A user has opened a support ticket and no staff member has claimed it yet.
+Your job is to:
+1. Greet the user warmly and acknowledge their issue.
+2. Try your best to resolve their issue using general knowledge.
+3. Let them know that a staff member will be with them if you cannot fully help.
 
-AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").lower() == "true"
-AUTO_REPLY_DELAY_SEC = int(os.getenv("AUTO_REPLY_DELAY_SEC", "0"))
-
-AUTO_REPLY_DISCLOSE = os.getenv("AUTO_REPLY_DISCLOSE", "true").lower() == "true"
-
-AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "true").lower() == "true"
-AI_REPLY_DELAY_SEC = int(os.getenv("AI_REPLY_DELAY_SEC", "2"))
-AI_REPLY_MAX_CHARS = int(os.getenv("AI_REPLY_MAX_CHARS", "1200"))
-
-AI_DEBUG = os.getenv("AI_DEBUG", "true").lower() == "true"
-
-KNOWLEDGE_PATH = os.getenv(
-    "KNOWLEDGE_PATH",
-    os.path.join(os.path.dirname(__file__), "support_knowledge.md"),
-)
+Keep your replies concise, friendly, and professional.
+Do NOT pretend to be a human staff member — you are an AI assistant.
+If the user's issue requires account-specific or server-specific action only staff can do, say so clearly.
+"""
 
 
-def _shorten(text, limit):
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)] + "..."
+class AIAssistant(commands.Cog):
+    """Virtual AI assistant for unclaimed Modmail threads."""
 
-
-class AISupport(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.coll = bot.api.get_plugin_partition(self)
-        self._pending_initial = {}  # thread_id -> task
-        self._pending_user = {}  # thread_id -> task
-        self.knowledge = self._load_knowledge()
+        self.ollama_url = bot.config.get("OLLAMA_URL", "https://ai.tacogroup.uk")
+        self.ollama_model = bot.config.get("OLLAMA_MODEL", "llama3")
+        # Tracks active AI sessions: thread channel_id -> list of message dicts
+        self.active_threads: dict[int, list[dict]] = {}
+        # Tracks claimed threads so AI stops responding
+        self.claimed_threads: set[int] = set()
 
-    def _load_knowledge(self):
-        try:
-            with open(KNOWLEDGE_PATH, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                return content
-        except FileNotFoundError:
-            return ""
-        except Exception:
-            return ""
-
-    async def _ollama_generate(self, prompt, system):
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "system": system,
-            "stream": False,
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=45) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                return data.get("response", "").strip()
-
-    def _system_with_knowledge(self, base_system):
-        if not self.knowledge:
-            return base_system
-        return (
-            base_system
-            + "\n\nYou have access to internal dashboard knowledge. "
-            + "Use it to answer questions accurately. "
-            + "If something is not covered, say you’re unsure and ask a clarifying question.\n\n"
-            + "=== SUPPORT KNOWLEDGE ===\n"
-            + self.knowledge
-            + "\n=== END KNOWLEDGE ==="
-        )
-
-    async def _send_to_thread(self, thread, content):
-        if hasattr(thread, "reply"):
-            return await thread.reply(content)
-
-        channel = getattr(thread, "channel", None)
-        if channel:
-            return await channel.send(content)
-
-    async def _send_to_staff_channel(self, thread, content):
-        channel = getattr(thread, "channel", None)
-        if channel:
-            return await channel.send(content)
-
-    async def _is_claimed_or_replied(self, thread_id):
-        doc = await self.coll.find_one({"_id": f"thread:{thread_id}"})
-        if not doc:
-            return False
-        return bool(doc.get("claimed") or doc.get("staff_replied"))
-
-    async def _schedule_initial_auto_reply(self, thread, creator, initial_message):
-        if not AUTO_REPLY_ENABLED:
-            return
-
-        thread_id = getattr(thread, "id", None)
-        if thread_id is None:
-            return
-
-        existing = self._pending_initial.get(thread_id)
-        if existing:
-            existing.cancel()
-
-        async def _task():
-            try:
-                await asyncio.sleep(AUTO_REPLY_DELAY_SEC)
-
-                if await self._is_claimed_or_replied(thread_id):
-                    return
-
-                user_text = getattr(initial_message, "content", "")
-                user_text = _shorten(user_text or "", 1200)
-
-                base_system = (
-                    "You are a support assistant for a Discord server. "
-                    "Be concise, polite, and helpful. Ask one clarifying question if needed. "
-                    "Do not promise anything or claim to be a human."
-                )
-                system = self._system_with_knowledge(base_system)
-
-                if AUTO_REPLY_DISCLOSE:
-                    prefix = "Thanks for reaching out! I'm an automated assistant while a staff member is away. "
-                else:
-                    prefix = "Thanks for reaching out! "
-
-                prompt = (
-                    f"User message:\n{user_text}\n\n"
-                    "Draft a short reply that acknowledges the issue, offers a helpful next step, "
-                    "and asks for missing info if needed."
-                )
-
-                reply = await self._ollama_generate(prompt, system)
-                reply = _shorten(reply, 1200)
-
-                await self._send_to_thread(thread, prefix + reply)
-
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                channel = getattr(thread, "channel", None)
-                if channel:
-                    await channel.send(f"[AI auto-reply failed] {e}")
-
-        self._pending_initial[thread_id] = asyncio.create_task(_task())
-
-    async def _schedule_user_ai_reply(self, thread, message):
-        if not AI_ASSIST_ENABLED:
-            return
-
-        thread_id = getattr(thread, "id", None)
-        if thread_id is None:
-            return
-
-        existing = self._pending_user.get(thread_id)
-        if existing:
-            existing.cancel()
-
-        async def _task():
-            try:
-                await asyncio.sleep(AI_REPLY_DELAY_SEC)
-
-                if await self._is_claimed_or_replied(thread_id):
-                    return
-
-                user_text = getattr(message, "content", "")
-                user_text = _shorten(user_text or "", 1200)
-
-                base_system = (
-                    "You are a support assistant for a Discord server. "
-                    "Be concise, polite, and helpful. Ask one clarifying question if needed. "
-                    "Do not promise anything or claim to be a human."
-                )
-                system = self._system_with_knowledge(base_system)
-
-                if AUTO_REPLY_DISCLOSE:
-                    prefix = "I'm an automated assistant while a staff member is away. "
-                else:
-                    prefix = ""
-
-                prompt = (
-                    f"User message:\n{user_text}\n\n"
-                    "Draft a helpful reply that moves the issue forward."
-                )
-
-                reply = await self._ollama_generate(prompt, system)
-                reply = _shorten(reply, AI_REPLY_MAX_CHARS)
-
-                await self._send_to_thread(thread, prefix + reply)
-
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                await self._send_to_staff_channel(thread, f"[AI reply failed] {e}")
-
-        self._pending_user[thread_id] = asyncio.create_task(_task())
-
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author.bot:
-            return
-        if message.guild is not None:
-            return
-
-        thread = None
-        for _ in range(10):
-            thread = await self.bot.threads.find(recipient=message.author)
-            if thread is not None:
-                break
-            await asyncio.sleep(0.5)
-
-        if thread is None:
-            return
-
-        await self._schedule_user_ai_reply(thread, message)
+    # ------------------------------------------------------------------
+    # Thread lifecycle events
+    # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
-        await self._schedule_initial_auto_reply(thread, creator, initial_message)
+        """Called when a new Modmail thread channel is fully set up."""
+        channel_id = thread.channel.id
+        self.active_threads[channel_id] = []
+
+        # Send an initial greeting from the AI
+        user_text = (
+            initial_message.content
+            if initial_message and initial_message.content
+            else "Hello, I need some help."
+        )
+        await self._reply_as_ai(thread.channel, user_text)
 
     @commands.Cog.listener()
-    async def on_thread_reply(self, thread, from_mod, message, anonymous, plain):
-        thread_id = getattr(thread, "id", None)
-        if thread_id is None:
+    async def on_thread_close(self, thread, closer, silent, delete_channel, message, scheduled):
+        """Clean up state when a thread is closed."""
+        channel_id = thread.channel.id
+        self.active_threads.pop(channel_id, None)
+        self.claimed_threads.discard(channel_id)
+
+    # ------------------------------------------------------------------
+    # Message listener — respond to user messages in unclaimed threads
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Ignore bots (including ourselves)
+        if message.author.bot:
             return
 
-        if from_mod:
-            await self.coll.update_one(
-                {"_id": f"thread:{thread_id}"},
-                {"$set": {"staff_replied": True, "claimed": True, "staff_replied_at": datetime.now(timezone.utc)}},
-                upsert=True,
+        channel_id = message.channel.id
+
+        # Only act on channels we're tracking (open threads)
+        if channel_id not in self.active_threads:
+            return
+
+        # Stop if a mod has claimed the thread
+        if channel_id in self.claimed_threads:
+            return
+
+        # Ignore messages from staff in the thread channel (mods replying)
+        # Modmail posts mod replies as webhooks/bot messages, so real human
+        # messages in the *thread channel* are mods — claim the thread.
+        if message.guild and message.channel.guild == message.guild:
+            # A real (non-bot) human typed in the mod-side thread channel
+            self.claimed_threads.add(channel_id)
+            self.active_threads.pop(channel_id, None)
+            return
+
+        # User message coming through — get AI response
+        await self._reply_as_ai(message.channel, message.content)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _reply_as_ai(self, channel: discord.TextChannel, user_message: str):
+        """Build conversation history, call Ollama, send reply."""
+        channel_id = channel.id
+        history = self.active_threads.get(channel_id, [])
+
+        # Append the new user message to history
+        history.append({"role": "user", "content": user_message})
+
+        async with channel.typing():
+            ai_reply = await self._call_ollama(history)
+
+        if ai_reply:
+            # Append AI reply to history for multi-turn context
+            history.append({"role": "assistant", "content": ai_reply})
+            self.active_threads[channel_id] = history
+
+            embed = discord.Embed(
+                description=ai_reply,
+                color=discord.Color.blurple(),
             )
-            task = self._pending_initial.pop(thread_id, None)
-            if task:
-                task.cancel()
-            task = self._pending_user.pop(thread_id, None)
-            if task:
-                task.cancel()
-            return
+            embed.set_author(name="🤖 AI Assistant (virtual support)")
+            embed.set_footer(text="A staff member will be with you shortly if needed.")
+            await channel.send(embed=embed)
 
-        await self._schedule_user_ai_reply(thread, message)
+    async def _call_ollama(self, messages: list[dict]) -> str | None:
+        """Send a chat request to the Ollama API and return the response text."""
+        url = f"{self.ollama_url.rstrip('/')}/api/chat"
+        payload = {
+            "model": self.ollama_model,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            "stream": False,
+        }
 
-    @commands.Cog.listener()
-    async def on_thread_claim(self, thread, mod):
-        thread_id = getattr(thread, "id", None)
-        if thread_id is None:
-            return
-        await self.coll.update_one(
-            {"_id": f"thread:{thread_id}"},
-            {"$set": {"claimed": True, "claimed_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-        task = self._pending_initial.pop(thread_id, None)
-        if task:
-            task.cancel()
-        task = self._pending_user.pop(thread_id, None)
-        if task:
-            task.cancel()
-
-    @commands.Cog.listener()
-    async def on_thread_unclaim(self, thread, mod):
-        thread_id = getattr(thread, "id", None)
-        if thread_id is None:
-            return
-        await self.coll.update_one(
-            {"_id": f"thread:{thread_id}"},
-            {"$set": {"claimed": False}},
-            upsert=True,
-        )
-
-    @commands.command()
-    async def ai(self, ctx, *, message):
-        """Staff command: -ai <message> — generate a draft reply."""
-        base_system = (
-            "You are an assistant that drafts responses for staff. "
-            "Return a short, professional reply. Do not mention AI."
-        )
-        system = self._system_with_knowledge(base_system)
-
-        prompt = f"User message:\n{message}\n\nDraft a helpful reply for staff to send."
         try:
-            draft = await self._ollama_generate(prompt, system)
-            draft = _shorten(draft, AI_REPLY_MAX_CHARS)
-            await ctx.send(f"**AI draft (not sent):**\n{draft}")
-        except Exception as e:
-            await ctx.send(f"[AI draft failed] {e}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        print(f"[ai_assistant] Ollama returned HTTP {resp.status}")
+                        return None
+                    data = await resp.json()
+                    return data.get("message", {}).get("content", "").strip()
+        except Exception as exc:
+            print(f"[ai_assistant] Error calling Ollama: {exc}")
+            return None
 
-    @commands.command()
-    async def ai_reload_knowledge(self, ctx):
-        """Staff command: -ai_reload_knowledge — reloads support_knowledge.md."""
-        self.knowledge = self._load_knowledge()
-        if self.knowledge:
-            await ctx.send("Reloaded AI knowledge.")
-        else:
-            await ctx.send("Knowledge file missing or empty.")
+    # ------------------------------------------------------------------
+    # Admin commands
+    # ------------------------------------------------------------------
+
+    @commands.command(name="ai_status")
+    @commands.has_permissions(manage_guild=True)
+    async def ai_status(self, ctx):
+        """Show which threads the AI is currently active in."""
+        active = len(self.active_threads)
+        claimed = len(self.claimed_threads)
+        await ctx.send(
+            f"🤖 **AI Assistant Status**\n"
+            f"Active (unclaimed) threads: **{active}**\n"
+            f"Claimed (AI silenced) threads: **{claimed}**"
+        )
+
+    @commands.command(name="ai_off")
+    @commands.has_permissions(manage_guild=True)
+    async def ai_off(self, ctx):
+        """Manually silence the AI in the current thread."""
+        self.claimed_threads.add(ctx.channel.id)
+        self.active_threads.pop(ctx.channel.id, None)
+        await ctx.send("🤖 AI Assistant has been silenced in this thread.")
 
 
 async def setup(bot):
-    await bot.add_cog(AISupport(bot))
+    await bot.add_cog(AIAssistant(bot))
