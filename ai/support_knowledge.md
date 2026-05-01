@@ -1,50 +1,160 @@
-# Taco Support Dashboard Knowledge
+# Taco Support Dashboard Knowledgebase (Advanced + Feature Map)
 
-## Overview
-- This document is used by the AI assistant to answer questions about the Taco Support dashboard.
-- If unsure, the AI should ask a clarifying question and avoid guessing.
+> Purpose: Accurate support for dashboard, marketplace, and admin features.
+> Rule: If unsure, ask one clarifying question and avoid guessing.
 
-## Login & Access
-- Users sign in with their Discord account.
-- Staff roles determine which sections are visible.
-- If access is missing, ask for the user’s Discord role or staff role.
+---
 
-## Main Navigation
-- Dashboard: Overview metrics and recent activity.
-- Tickets/Threads: Active support conversations.
-- Users: Customer profiles and history.
-- Products/Marketplace: Product listings and detail pages.
-- Settings: Workspace settings and integration keys.
+## 1) Feature Map (Routes → Features)
 
-## Common Tasks
+### Public & Auth
+- **/login**: Login
+- **/register**: Register
+- **/auth/success**: OAuth callback
 
-### Reset an API Key
-- Go to Settings → API Keys
-- Click Regenerate
-- The old key becomes invalid immediately
+### Marketplace (Public)
+- **/marketplace**: Marketplace home
+- **/marketplace/workspace/:workspaceId**: Workspace storefront
+- **/marketplace/product/:productId**: Public product detail page
+
+### Workspace Dashboard
+- **/**: Dashboard home
+- **/analytics**: Metrics and charts
+- **/customers**: Customers list
+- **/customers/:userId**: Customer detail
+- **/announcements**: Workspace announcements
+- **/status**: Status Center (API + Discord/Bot)
+- **/documentation**: Documentation
+- **/obfuscator**: Script obfuscation tools
+- **/referrals**: Referral program
+- **/workspace/:workspaceId**: Workspace detail
+- **/workspace/:workspaceId/product/:productId**: Product detail (workspace view)
+
+### Subscription / Billing
+- **/subscription/manage**: Manage subscription
+- **/subscription/success**: Subscription success
+- **/subscription/cancel**: Subscription cancel
+
+### Messaging / Inbox
+- **/messages**: Conversations list
+- **/messages/:conversationId**: Conversation detail
+
+### Admin Console
+- **/admin**: Admin home
+- **/admin/users**: User management
+- **/admin/workspaces**: Workspace management
+- **/admin/products**: Product management
+- **/admin/licenses**: License management
+- **/admin/coin-shop**: Coin shop management
+- **/admin/broadcast**: System broadcast
+- **/admin/announcements**: Admin announcements
+- **/admin/status-updates**: Status updates
+- **/admin/notifications**: Notification settings
+
+### User Settings
+- **/user/settings**: Account settings
+
+### Customer Mode
+- **/**: Customer dashboard
+- **/support**: Customer support page
+- **/messages**: Customer messages
+- **/messages/:conversationId**: Customer conversation detail
+- **/user/settings**: Customer settings
+
+---
+
+## 2) Common Tasks (Step‑By‑Step)
 
 ### Create a Product
-- Go to Products → New Product
-- Enter name, price, and description
-- Save to publish
+- **Products** → **New Product**
+- Fill name, price, description
+- Save as **Draft** or **Active**
 
-### Manage Listings
-- Products can be Active or Draft
-- Drafts are not visible publicly
-- Image uploads appear after processing (proxy may be used)
+### Publish/Hide a Product
+- **Products** → open product → set **Active** or **Archived**
 
-### View a User
-- Search Users by Discord ID or username
-- Open profile to see purchases and history
+### View a Customer
+- **Customers** → select user
+- See purchases, licenses, and status
 
-## Billing & Payments
+### Reset API Key
+- **Settings** → **API Keys**
+- Click **Regenerate**
+- Old key invalidates immediately
+
+### Manage Subscription
+- **Subscription** → **Manage**
+- Open billing portal and update payment info
+
+---
+
+## 3) Public vs Workspace vs Admin Views
+
+### Public Pages
+- Marketplace and product pages are **public** (no login required)
+- Never show owner/admin‑only data
+
+### Workspace Pages
+- Only accessible after login
+- Scoped to selected workspace
+
+### Admin Pages
+- Admin‑only; for moderation and global operations
+
+---
+
+## 4) Billing & Payments
+
 - Stripe is the only supported checkout.
-- If checkout fails: ask for the error code and browser console details.
+- If checkout fails: ask for error code + last 4 digits.
+- Subscription success/cancel handled by `/subscription/*` routes.
 
-## Troubleshooting
-- Missing data: Ask which workspace they are in.
-- CORS image errors: The proxy endpoint should be used.
-- 403 errors: Likely permission/role related.
+---
 
-## Escalation
-- For system-wide outages, notify staff lead and provide time and error details.
+## 5) Troubleshooting Guide
+
+### “Product not visible”
+- Check product is **Active**
+- Confirm correct workspace
+- Confirm user is on public marketplace page
+
+### “Checkout failed”
+- Ask for Stripe error code
+- Check browser + device
+- Verify Stripe status page
+
+### “Image not loading”
+- Ask for the image URL
+- Confirm proxy is enabled and used
+
+### “Access denied (403)”
+- Confirm user role in workspace
+- Ask for Discord role
+
+### “Webhook not firing”
+- Verify webhook URL
+- Check webhook logs
+- Confirm event type is enabled
+
+---
+
+## 6) Security & Alerts
+
+- Security Alerts for suspicious scripts or content
+- Manual Review requires staff approval before visible
+
+---
+
+## 7) AI Response Style
+
+- Provide one clear next step
+- Ask one clarifying question if missing key info
+- Do not mention AI to customers unless configured
+
+---
+
+## 8) Escalation Rules
+
+- System‑wide issue → notify staff lead
+- Billing outages → check Stripe status
+- Auth issues → request timestamps + screenshots
