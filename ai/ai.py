@@ -59,6 +59,8 @@ class AIAssistant(commands.Cog):
         self.active_threads: dict[int, list[dict]] = {}
         # Tracks claimed threads so AI stops responding
         self.claimed_threads: set[int] = set()
+        # Maps recipient user_id -> thread channel_id for DM lookup
+        self.user_to_channel: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Thread lifecycle events
@@ -69,6 +71,7 @@ class AIAssistant(commands.Cog):
         """Called when a new Modmail thread channel is fully set up."""
         channel_id = thread.channel.id
         self.active_threads[channel_id] = []
+        self.user_to_channel[thread.recipient.id] = channel_id
 
         # Send an initial greeting from the AI
         user_text = (
@@ -84,6 +87,8 @@ class AIAssistant(commands.Cog):
         channel_id = thread.channel.id
         self.active_threads.pop(channel_id, None)
         self.claimed_threads.discard(channel_id)
+        if thread.recipient:
+            self.user_to_channel.pop(thread.recipient.id, None)
 
     # ------------------------------------------------------------------
     # Message listener — respond to user messages in unclaimed threads
@@ -95,23 +100,31 @@ class AIAssistant(commands.Cog):
         if message.author.bot:
             return
 
-        channel_id = message.channel.id
-
-        # Only act on channels we're tracking (open threads)
-        if channel_id not in self.active_threads:
+        # --- Staff-side: message in a guild channel ---
+        if message.guild:
+            channel_id = message.channel.id
+            # If a real human typed in a tracked thread channel, a mod has claimed it
+            if channel_id in self.active_threads and channel_id not in self.claimed_threads:
+                self.claimed_threads.add(channel_id)
+                self.active_threads.pop(channel_id, None)
+                # Clean up user mapping too
+                for uid, cid in list(self.user_to_channel.items()):
+                    if cid == channel_id:
+                        self.user_to_channel.pop(uid, None)
+                        break
             return
+
+        # --- User-side: DM message ---
+        # Look up the thread channel by the user's ID
+        channel_id = self.user_to_channel.get(message.author.id)
+        if channel_id is None:
+            return  # Not a user we're tracking
 
         # Stop if a mod has claimed the thread
         if channel_id in self.claimed_threads:
             return
 
-        # If the message is in a guild channel (staff side), a mod just typed — claim it
-        if message.guild:
-            self.claimed_threads.add(channel_id)
-            self.active_threads.pop(channel_id, None)
-            return
-
-        # Message is a DM from the user — look up the thread and reply
+        # Look up the live thread object and reply
         thread = self.bot.threads.find_by_recipient(message.author)
         if thread is None:
             return
