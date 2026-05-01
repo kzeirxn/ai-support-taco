@@ -14,8 +14,9 @@ AUTO_REPLY_DELAY_SEC = int(os.getenv("AUTO_REPLY_DELAY_SEC", "120"))
 
 AUTO_REPLY_DISCLOSE = os.getenv("AUTO_REPLY_DISCLOSE", "true").lower() == "true"
 
-SUGGEST_ENABLED = os.getenv("SUGGEST_ENABLED", "true").lower() == "true"
-SUGGEST_MAX_CHARS = int(os.getenv("SUGGEST_MAX_CHARS", "900"))
+AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "true").lower() == "true"
+AI_REPLY_DELAY_SEC = int(os.getenv("AI_REPLY_DELAY_SEC", "2"))
+AI_REPLY_MAX_CHARS = int(os.getenv("AI_REPLY_MAX_CHARS", "1200"))
 
 KNOWLEDGE_PATH = os.getenv(
     "KNOWLEDGE_PATH",
@@ -33,7 +34,8 @@ class AISupport(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.coll = bot.api.get_plugin_partition(self)
-        self._pending = {}  # thread_id -> task
+        self._pending_initial = {}  # thread_id -> task
+        self._pending_user = {}  # thread_id -> task
         self.knowledge = self._load_knowledge()
 
     def _load_knowledge(self):
@@ -85,7 +87,13 @@ class AISupport(commands.Cog):
         if channel:
             return await channel.send(content)
 
-    async def _schedule_auto_reply(self, thread, creator, initial_message):
+    async def _is_claimed_or_replied(self, thread_id):
+        doc = await self.coll.find_one({"_id": f"thread:{thread_id}"})
+        if not doc:
+            return False
+        return bool(doc.get("claimed") or doc.get("staff_replied"))
+
+    async def _schedule_initial_auto_reply(self, thread, creator, initial_message):
         if not AUTO_REPLY_ENABLED:
             return
 
@@ -93,7 +101,7 @@ class AISupport(commands.Cog):
         if thread_id is None:
             return
 
-        existing = self._pending.get(thread_id)
+        existing = self._pending_initial.get(thread_id)
         if existing:
             existing.cancel()
 
@@ -101,8 +109,7 @@ class AISupport(commands.Cog):
             try:
                 await asyncio.sleep(AUTO_REPLY_DELAY_SEC)
 
-                doc = await self.coll.find_one({"_id": f"thread:{thread_id}"})
-                if doc and doc.get("staff_replied"):
+                if await self._is_claimed_or_replied(thread_id):
                     return
 
                 user_text = getattr(initial_message, "content", "")
@@ -138,11 +145,62 @@ class AISupport(commands.Cog):
                 if channel:
                     await channel.send(f"[AI auto-reply failed] {e}")
 
-        self._pending[thread_id] = asyncio.create_task(_task())
+        self._pending_initial[thread_id] = asyncio.create_task(_task())
+
+    async def _schedule_user_ai_reply(self, thread, message):
+        if not AI_ASSIST_ENABLED:
+            return
+
+        thread_id = getattr(thread, "id", None)
+        if thread_id is None:
+            return
+
+        existing = self._pending_user.get(thread_id)
+        if existing:
+            existing.cancel()
+
+        async def _task():
+            try:
+                await asyncio.sleep(AI_REPLY_DELAY_SEC)
+
+                if await self._is_claimed_or_replied(thread_id):
+                    return
+
+                user_text = getattr(message, "content", "")
+                user_text = _shorten(user_text or "", 1200)
+
+                base_system = (
+                    "You are a support assistant for a Discord server. "
+                    "Be concise, polite, and helpful. Ask one clarifying question if needed. "
+                    "Do not promise anything or claim to be a human."
+                )
+                system = self._system_with_knowledge(base_system)
+
+                if AUTO_REPLY_DISCLOSE:
+                    prefix = "I'm an automated assistant while a staff member is away. "
+                else:
+                    prefix = ""
+
+                prompt = (
+                    f"User message:\n{user_text}\n\n"
+                    "Draft a helpful reply that moves the issue forward."
+                )
+
+                reply = await self._ollama_generate(prompt, system)
+                reply = _shorten(reply, AI_REPLY_MAX_CHARS)
+
+                await self._send_to_thread(thread, prefix + reply)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                await self._send_to_staff_channel(thread, f"[AI reply failed] {e}")
+
+        self._pending_user[thread_id] = asyncio.create_task(_task())
 
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
-        await self._schedule_auto_reply(thread, creator, initial_message)
+        await self._schedule_initial_auto_reply(thread, creator, initial_message)
 
     @commands.Cog.listener()
     async def on_thread_reply(self, thread, from_mod, message, anonymous, plain):
@@ -153,58 +211,46 @@ class AISupport(commands.Cog):
         if from_mod:
             await self.coll.update_one(
                 {"_id": f"thread:{thread_id}"},
-                {"$set": {"staff_replied": True, "staff_replied_at": datetime.now(timezone.utc)}},
+                {"$set": {"staff_replied": True, "claimed": True, "staff_replied_at": datetime.now(timezone.utc)}},
                 upsert=True,
             )
-            task = self._pending.pop(thread_id, None)
+            task = self._pending_initial.pop(thread_id, None)
+            if task:
+                task.cancel()
+            task = self._pending_user.pop(thread_id, None)
             if task:
                 task.cancel()
             return
 
-        if not SUGGEST_ENABLED:
+        await self._schedule_user_ai_reply(thread, message)
+
+    @commands.Cog.listener()
+    async def on_thread_claim(self, thread, mod):
+        thread_id = getattr(thread, "id", None)
+        if thread_id is None:
             return
+        await self.coll.update_one(
+            {"_id": f"thread:{thread_id}"},
+            {"$set": {"claimed": True, "claimed_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        task = self._pending_initial.pop(thread_id, None)
+        if task:
+            task.cancel()
+        task = self._pending_user.pop(thread_id, None)
+        if task:
+            task.cancel()
 
-        user_text = getattr(message, "content", "")
-        if not user_text:
+    @commands.Cog.listener()
+    async def on_thread_unclaim(self, thread, mod):
+        thread_id = getattr(thread, "id", None)
+        if thread_id is None:
             return
-
-        base_system = (
-            "You are an assistant that drafts responses for staff. "
-            "Return a short, professional reply. Do not mention AI."
+        await self.coll.update_one(
+            {"_id": f"thread:{thread_id}"},
+            {"$set": {"claimed": False}},
+            upsert=True,
         )
-        system = self._system_with_knowledge(base_system)
-
-        prompt = (
-            f"User message:\n{user_text}\n\n"
-            "Draft a helpful reply for staff to send."
-        )
-
-        try:
-            draft = await self._ollama_generate(prompt, system)
-            draft = _shorten(draft, SUGGEST_MAX_CHARS)
-            await self._send_to_staff_channel(thread, f"**AI draft (not sent):**\n{draft}")
-        except Exception as e:
-            await self._send_to_staff_channel(thread, f"[AI draft failed] {e}")
-
-    @commands.command()
-    async def ai(self, ctx, *, message):
-        """Staff command: ?ai <message> — generate a draft reply."""
-        if not SUGGEST_ENABLED:
-            return await ctx.send("AI drafts are disabled.")
-
-        base_system = (
-            "You are an assistant that drafts responses for staff. "
-            "Return a short, professional reply. Do not mention AI."
-        )
-        system = self._system_with_knowledge(base_system)
-
-        prompt = f"User message:\n{message}\n\nDraft a helpful reply for staff to send."
-        try:
-            draft = await self._ollama_generate(prompt, system)
-            draft = _shorten(draft, SUGGEST_MAX_CHARS)
-            await ctx.send(f"**AI draft (not sent):**\n{draft}")
-        except Exception as e:
-            await ctx.send(f"[AI draft failed] {e}")
 
     @commands.command()
     async def ai_reload_knowledge(self, ctx):
