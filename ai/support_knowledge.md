@@ -1,7 +1,9 @@
-# Taco Support Dashboard Knowledgebase (Advanced + Feature Map)
+# Taco Licensing Dashboard Knowledgebase
 
 > Purpose: Accurate support for dashboard, marketplace, and admin features.
 > Rule: If unsure, ask one clarifying question and avoid guessing.
+
+# The API is https://app.tacolicensing.org and the frontend url for the dashboard is https://licensing.tacogroup.uk
 
 ---
 
