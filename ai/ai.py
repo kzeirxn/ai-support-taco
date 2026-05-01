@@ -11,6 +11,7 @@ Setup:
   Set OLLAMA_MODEL in your bot's .env or config (default: llama3)
 """
 
+import asyncio
 import os
 
 import aiohttp
@@ -46,6 +47,32 @@ Respond with ONLY the single word. No punctuation, no explanation.
 
 Message: {message}"""
 
+RESOLUTION_PROMPT = """You are reviewing a support conversation between an AI assistant and a user.
+Based on the conversation history below, has the user's issue been fully resolved?
+
+Respond with ONLY one word:
+- RESOLVED   (the AI provided a clear, complete answer and the user's question appears answered)
+- UNRESOLVED (the issue is still ongoing, unclear, or the user asked a follow-up question)
+
+Respond with ONLY the single word. No punctuation, no explanation.
+
+Conversation:
+{history}"""
+
+SUMMARY_PROMPT = """You are summarising a support ticket conversation for a staff member who is taking over.
+Write a concise summary (3-5 bullet points max) covering:
+- What the user's issue was
+- What the AI tried or explained
+- Current status (resolved, unresolved, escalated)
+- Any important details the staff member should know before replying
+
+Be brief and factual. Use plain text, no markdown headers.
+
+Conversation:
+{history}"""
+
+AUTO_CLOSE_DELAY = 120  # seconds to wait for user confirmation before closing
+
 
 def _load_system_prompt() -> str:
     """Load support_knowledge file and inject into the system prompt."""
@@ -65,13 +92,15 @@ class AIAssistant(commands.Cog):
         self.ollama_url = os.environ.get("OLLAMA_URL", "https://ai.tacogroup.uk")
         self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3")
         # Role ID to ping when escalating (set ESCALATION_ROLE_ID in .env)
-        self.escalation_role_id: int | None = int(r) if (r := os.environ.get("ESCALATION_ROLE_ID")) else 1401301393767141541
+        self.escalation_role_id: int | None = int(r) if (r := os.environ.get("ESCALATION_ROLE_ID")) else None
         # Tracks active AI sessions: thread channel_id -> list of message dicts
         self.active_threads: dict[int, list[dict]] = {}
         # Tracks claimed threads so AI stops responding
         self.claimed_threads: set[int] = set()
         # Maps recipient user_id -> thread channel_id for DM lookup
         self.user_to_channel: dict[int, int] = {}
+        # Tracks threads pending auto-close: channel_id -> asyncio.Task
+        self.pending_close: dict[int, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
     # Thread lifecycle events
@@ -100,6 +129,9 @@ class AIAssistant(commands.Cog):
         self.claimed_threads.discard(channel_id)
         if thread.recipient:
             self.user_to_channel.pop(thread.recipient.id, None)
+        task = self.pending_close.pop(channel_id, None)
+        if task:
+            task.cancel()
 
     # ------------------------------------------------------------------
     # Message listener — respond to user messages in unclaimed threads
@@ -116,13 +148,22 @@ class AIAssistant(commands.Cog):
             channel_id = message.channel.id
             # If a real human typed in a tracked thread channel, a mod has claimed it
             if channel_id in self.active_threads and channel_id not in self.claimed_threads:
+                history = self.active_threads.get(channel_id, [])
+
+                # Silence the AI first
                 self.claimed_threads.add(channel_id)
                 self.active_threads.pop(channel_id, None)
-                # Clean up user mapping too
+                task = self.pending_close.pop(channel_id, None)
+                if task:
+                    task.cancel()
                 for uid, cid in list(self.user_to_channel.items()):
                     if cid == channel_id:
                         self.user_to_channel.pop(uid, None)
                         break
+
+                # Post a summary if there's any conversation history
+                if history:
+                    asyncio.create_task(self._post_summary(message.channel, history))
             return
 
         # --- User-side: DM message ---
@@ -139,6 +180,21 @@ class AIAssistant(commands.Cog):
         thread = self.bot.threads.cache.get(message.author.id)
         if thread is None:
             return
+
+        # If there's a pending auto-close, the user replied — cancel it
+        task = self.pending_close.pop(channel_id, None)
+        if task:
+            task.cancel()
+            # Let the user know we're still here
+            still_here = discord.Embed(
+                description="No problem — let's keep going. What else can I help you with?",
+                color=discord.Color.blurple(),
+            )
+            still_here.set_author(name="🤖 AI Assistant")
+            try:
+                await thread.recipient.send(embed=still_here)
+            except discord.Forbidden:
+                pass
 
         await self._reply_as_ai(thread, message.content)
 
@@ -193,6 +249,126 @@ class AIAssistant(commands.Cog):
         )
         staff_embed.set_author(name="🤖 AI Assistant — sent to user")
         await channel.send(embed=staff_embed)
+
+        # 3. Check if the issue appears resolved and schedule auto-close if so
+        if await self._check_resolved(history):
+            print(f"[ai_assistant] Issue appears resolved in channel {channel_id} — scheduling auto-close")
+            task = asyncio.create_task(self._schedule_auto_close(thread))
+            self.pending_close[channel_id] = task
+
+    async def _post_summary(self, channel: discord.TextChannel, history: list[dict]):
+        """Generate and post a handoff summary for the claiming mod."""
+        url = f"{self.ollama_url.rstrip('/')}/api/chat"
+        history_text = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
+        )
+        payload = {
+            "model": self.ollama_model,
+            "messages": [
+                {"role": "user", "content": SUMMARY_PROMPT.format(history=history_text)}
+            ],
+            "stream": False,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json(content_type=None)
+                    summary = data.get("message", {}).get("content", "").strip()
+        except Exception as exc:
+            print(f"[ai_assistant] Summary generation failed ({type(exc).__name__}): {exc}")
+            return
+
+        if not summary:
+            return
+
+        embed = discord.Embed(
+            title="📋 AI Session Summary",
+            description=summary,
+            color=discord.Color.yellow(),
+        )
+        embed.set_footer(text="Handoff summary generated by AI assistant — AI has been silenced.")
+        await channel.send(embed=embed)
+
+    async def _check_resolved(self, history: list[dict]) -> bool:
+        """Ask Ollama if the conversation looks resolved. Returns True if RESOLVED."""
+        url = f"{self.ollama_url.rstrip('/')}/api/chat"
+        history_text = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
+        )
+        payload = {
+            "model": self.ollama_model,
+            "messages": [
+                {"role": "user", "content": RESOLUTION_PROMPT.format(history=history_text)}
+            ],
+            "stream": False,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status != 200:
+                        return False
+                    data = await resp.json(content_type=None)
+                    result = data.get("message", {}).get("content", "").strip().upper()
+                    return "RESOLVED" in result
+        except Exception as exc:
+            print(f"[ai_assistant] Resolution check failed ({type(exc).__name__}): {exc}")
+            return False  # Fail safe — don't auto-close if check errors
+
+    async def _schedule_auto_close(self, thread):
+        """Notify the user the ticket will close, wait for a reply, then close."""
+        channel = thread.channel
+        channel_id = channel.id
+
+        # Tell the user what's happening
+        confirm_embed = discord.Embed(
+            description=(
+                f"It looks like your issue has been resolved! 🎉\n\n"
+                f"This ticket will automatically close in **{AUTO_CLOSE_DELAY // 60} minutes** "
+                f"if there's nothing else you need.\n\n"
+                f"If you still need help, just reply here and I'll cancel the close."
+            ),
+            color=discord.Color.green(),
+        )
+        confirm_embed.set_author(name="🤖 AI Assistant")
+        try:
+            await thread.recipient.send(embed=confirm_embed)
+        except discord.Forbidden:
+            pass
+
+        # Also note in the staff channel
+        await channel.send(
+            embed=discord.Embed(
+                description=f"⏱️ AI believes issue is resolved. Thread will auto-close in {AUTO_CLOSE_DELAY // 60} min unless user replies.",
+                color=discord.Color.green(),
+            )
+        )
+
+        try:
+            await asyncio.sleep(AUTO_CLOSE_DELAY)
+        except asyncio.CancelledError:
+            # User replied — close was cancelled in on_message
+            print(f"[ai_assistant] Auto-close cancelled for channel {channel_id} — user replied")
+            return
+
+        # Double-check thread is still active (not already claimed/closed by a mod)
+        if channel_id not in self.active_threads or channel_id in self.claimed_threads:
+            return
+
+        self.pending_close.pop(channel_id, None)
+
+        # Close the thread via Modmail's own close method
+        try:
+            await thread.close(
+                closer=self.bot.user,
+                silent=False,
+                delete_channel=False,
+                message="✅ Ticket automatically closed by AI assistant after issue was resolved.",
+            )
+            print(f"[ai_assistant] Auto-closed thread {channel_id}")
+        except Exception as exc:
+            print(f"[ai_assistant] Failed to auto-close thread {channel_id}: {exc}")
 
     async def _check_sentiment(self, message: str) -> str:
         """Ask Ollama to classify sentiment. Returns NEGATIVE, NEUTRAL, or POSITIVE."""
