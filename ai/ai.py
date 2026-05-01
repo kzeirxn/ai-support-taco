@@ -10,13 +10,15 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ai.tacogroup.uk")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "true").lower() == "true"
-AUTO_REPLY_DELAY_SEC = int(os.getenv("AUTO_REPLY_DELAY_SEC", "120"))
+AUTO_REPLY_DELAY_SEC = int(os.getenv("AUTO_REPLY_DELAY_SEC", "0"))
 
 AUTO_REPLY_DISCLOSE = os.getenv("AUTO_REPLY_DISCLOSE", "true").lower() == "true"
 
 AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "true").lower() == "true"
 AI_REPLY_DELAY_SEC = int(os.getenv("AI_REPLY_DELAY_SEC", "2"))
 AI_REPLY_MAX_CHARS = int(os.getenv("AI_REPLY_MAX_CHARS", "1200"))
+
+AI_DEBUG = os.getenv("AI_DEBUG", "true").lower() == "true"
 
 KNOWLEDGE_PATH = os.getenv(
     "KNOWLEDGE_PATH",
@@ -206,7 +208,7 @@ class AISupport(commands.Cog):
             return
 
         thread = None
-        for _ in range(6):
+        for _ in range(10):
             thread = await self.bot.threads.find(recipient=message.author)
             if thread is not None:
                 break
