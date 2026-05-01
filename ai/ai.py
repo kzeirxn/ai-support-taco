@@ -198,18 +198,17 @@ class AISupport(commands.Cog):
 
         self._pending_user[thread_id] = asyncio.create_task(_task())
 
-    @commands.Cog.listener()
+        @commands.Cog.listener()
     async def on_message(self, message):
-        # Catch user DMs and map to a thread
         if message.author.bot:
             return
         if message.guild is not None:
             return
 
-        thread = await self.bot.thread_manager.find(recipient=message.author)
+        thread = await self.bot.threads.find(recipient=message.author)
         if thread is None:
             await asyncio.sleep(1)
-            thread = await self.bot.thread_manager.find(recipient=message.author)
+            thread = await self.bot.threads.find(recipient=message.author)
         if thread is None:
             return
 
