@@ -257,8 +257,25 @@ class AISupport(commands.Cog):
         )
 
     @commands.command()
+    async def ai(self, ctx, *, message):
+        """Staff command: -ai <message> — generate a draft reply."""
+        base_system = (
+            "You are an assistant that drafts responses for staff. "
+            "Return a short, professional reply. Do not mention AI."
+        )
+        system = self._system_with_knowledge(base_system)
+
+        prompt = f"User message:\n{message}\n\nDraft a helpful reply for staff to send."
+        try:
+            draft = await self._ollama_generate(prompt, system)
+            draft = _shorten(draft, AI_REPLY_MAX_CHARS)
+            await ctx.send(f"**AI draft (not sent):**\n{draft}")
+        except Exception as e:
+            await ctx.send(f"[AI draft failed] {e}")
+
+    @commands.command()
     async def ai_reload_knowledge(self, ctx):
-        """Staff command: ?ai_reload_knowledge — reloads support_knowledge.md."""
+        """Staff command: -ai_reload_knowledge — reloads support_knowledge.md."""
         self.knowledge = self._load_knowledge()
         if self.knowledge:
             await ctx.send("Reloaded AI knowledge.")
