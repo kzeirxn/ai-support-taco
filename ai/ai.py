@@ -125,7 +125,7 @@ class AIAssistant(commands.Cog):
             return
 
         # Look up the live thread object and reply
-        thread = self.bot.threads.find_by_recipient(message.author)
+        thread = self.bot.threads.find_by_id(message.author.id)
         if thread is None:
             return
 
@@ -185,17 +185,25 @@ class AIAssistant(commands.Cog):
             "stream": False,
         }
 
+        print(f"[ai_assistant] Calling Ollama at {url} with model {self.ollama_model}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    raw = await resp.text()
+                    print(f"[ai_assistant] Ollama HTTP {resp.status} — response: {raw[:500]}")
                     if resp.status != 200:
-                        print(f"[ai_assistant] Ollama returned HTTP {resp.status}")
                         return None
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                     return data.get("message", {}).get("content", "").strip()
+        except aiohttp.ClientConnectorError as exc:
+            print(f"[ai_assistant] Connection error — could not reach {url}: {exc}")
+        except aiohttp.ServerTimeoutError:
+            print(f"[ai_assistant] Timeout — Ollama did not respond within 30s")
         except Exception as exc:
-            print(f"[ai_assistant] Error calling Ollama: {exc}")
-            return None
+            import traceback
+            print(f"[ai_assistant] Unexpected error ({type(exc).__name__}): {exc}")
+            traceback.print_exc()
+        return None
 
     # ------------------------------------------------------------------
     # Admin commands
