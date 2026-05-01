@@ -198,7 +198,7 @@ class AISupport(commands.Cog):
 
         self._pending_user[thread_id] = asyncio.create_task(_task())
 
-        @commands.Cog.listener()
+    @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot:
             return
