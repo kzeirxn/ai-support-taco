@@ -72,6 +72,8 @@ Conversation:
 {history}"""
 
 AUTO_CLOSE_DELAY = 120  # seconds to wait for user confirmation before closing
+OLLAMA_TIMEOUT   = 120  # seconds — llama3 can be slow on first response
+OLLAMA_RETRIES   = 2    # number of retries on timeout before giving up
 
 
 def _load_system_prompt() -> str:
@@ -90,7 +92,7 @@ class AIAssistant(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.ollama_url = os.environ.get("OLLAMA_URL", "https://ai.tacogroup.uk")
-        self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3")
+        self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
         # Role ID to ping when escalating (set ESCALATION_ROLE_ID in .env)
         self.escalation_role_id: int | None = int(r) if (r := os.environ.get("ESCALATION_ROLE_ID")) else None
         # Tracks active AI sessions: thread channel_id -> list of message dicts
@@ -258,27 +260,11 @@ class AIAssistant(commands.Cog):
 
     async def _post_summary(self, channel: discord.TextChannel, history: list[dict]):
         """Generate and post a handoff summary for the claiming mod."""
-        url = f"{self.ollama_url.rstrip('/')}/api/chat"
         history_text = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
         )
-        payload = {
-            "model": self.ollama_model,
-            "messages": [
-                {"role": "user", "content": SUMMARY_PROMPT.format(history=history_text)}
-            ],
-            "stream": False,
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status != 200:
-                        return
-                    data = await resp.json(content_type=None)
-                    summary = data.get("message", {}).get("content", "").strip()
-        except Exception as exc:
-            print(f"[ai_assistant] Summary generation failed ({type(exc).__name__}): {exc}")
-            return
+        messages = [{"role": "user", "content": SUMMARY_PROMPT.format(history=history_text)}]
+        summary = await self._ollama_post(messages)
 
         if not summary:
             return
@@ -430,33 +416,68 @@ class AIAssistant(commands.Cog):
         except discord.Forbidden:
             pass
 
-    async def _call_ollama(self, messages: list[dict]) -> str | None:
-        """Send a chat request to the Ollama API and return the response text."""
-        url = f"{self.ollama_url.rstrip('/')}/api/chat"
-        payload = {
-            "model": self.ollama_model,
-            "messages": [{"role": "system", "content": _load_system_prompt()}] + messages,
-            "stream": False,
-        }
+    async def _check_resolved(self, history: list[dict]) -> bool:
+        """Ask Ollama if the conversation looks resolved. Returns True if RESOLVED."""
+        history_text = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
+        )
+        messages = [{"role": "user", "content": RESOLUTION_PROMPT.format(history=history_text)}]
+        result = await self._ollama_post(messages)
+        if result is None:
+            return False  # Fail safe — don't auto-close if check errors
+        return "RESOLVED" in result.upper()
 
-        print(f"[ai_assistant] Calling Ollama at {url} with model {self.ollama_model}")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    raw = await resp.text()
-                    print(f"[ai_assistant] Ollama HTTP {resp.status} — response: {raw[:500]}")
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json(content_type=None)
-                    return data.get("message", {}).get("content", "").strip()
-        except aiohttp.ClientConnectorError as exc:
-            print(f"[ai_assistant] Connection error — could not reach {url}: {exc}")
-        except aiohttp.ServerTimeoutError:
-            print(f"[ai_assistant] Timeout — Ollama did not respond within 30s")
-        except Exception as exc:
-            import traceback
-            print(f"[ai_assistant] Unexpected error ({type(exc).__name__}): {exc}")
-            traceback.print_exc()
+    async def _check_sentiment(self, message: str) -> str:
+        """Ask Ollama to classify sentiment. Returns NEGATIVE, NEUTRAL, or POSITIVE."""
+        messages = [{"role": "user", "content": SENTIMENT_PROMPT.format(message=message)}]
+        result = await self._ollama_post(messages)
+        if result is None:
+            return "NEUTRAL"  # Fail safe — don't block the AI on error
+        result = result.upper()
+        if "NEGATIVE" in result:
+            return "NEGATIVE"
+        if "POSITIVE" in result:
+            return "POSITIVE"
+        return "NEUTRAL"
+
+    async def _call_ollama(self, messages: list[dict]) -> str | None:
+        """Send a chat completion request to Ollama and return the response text."""
+        full_messages = [{"role": "system", "content": _load_system_prompt()}] + messages
+        print(f"[ai_assistant] Calling Ollama at {self.ollama_url} with model {self.ollama_model}")
+        return await self._ollama_post(full_messages)
+
+    async def _ollama_post(self, messages: list[dict]) -> str | None:
+        """Shared Ollama HTTP caller with retry logic and extended timeout."""
+        url = f"{self.ollama_url.rstrip('/')}/api/chat"
+        payload = {"model": self.ollama_model, "messages": messages, "stream": False}
+
+        for attempt in range(1, OLLAMA_RETRIES + 2):  # +2 = initial try + retries
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url, json=payload, timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+                    ) as resp:
+                        raw = await resp.text()
+                        if resp.status != 200:
+                            print(f"[ai_assistant] Ollama HTTP {resp.status}: {raw[:300]}")
+                            return None
+                        data = await resp.json(content_type=None)
+                        return data.get("message", {}).get("content", "").strip()
+            except (TimeoutError, asyncio.TimeoutError, aiohttp.ServerTimeoutError):
+                wait = 2 ** attempt
+                print(f"[ai_assistant] Timeout on attempt {attempt}/{OLLAMA_RETRIES + 1} — retrying in {wait}s")
+                if attempt <= OLLAMA_RETRIES:
+                    await asyncio.sleep(wait)
+            except aiohttp.ClientConnectorError as exc:
+                print(f"[ai_assistant] Connection error — could not reach {url}: {exc}")
+                return None
+            except Exception as exc:
+                import traceback
+                print(f"[ai_assistant] Unexpected error ({type(exc).__name__}): {exc}")
+                traceback.print_exc()
+                return None
+
+        print(f"[ai_assistant] All {OLLAMA_RETRIES + 1} attempts timed out — giving up")
         return None
 
     # ------------------------------------------------------------------
