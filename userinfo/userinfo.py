@@ -1,18 +1,12 @@
 """
 user_info - Modmail Plugin
-Fetches player/user data from your existing staff API when a support thread
+Fetches player/user data from staff API when a support thread
 opens, and posts a summary embed for staff to review.
-
-Setup
------
-Add these to your Modmail config (.env / config.py):
-
-    BACKEND_BASE_URL   - e.g. https://api.yoursite.com/api/v1
-    BACKEND_API_KEY    - JWT for a staff/master-admin service account
 """
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 import aiohttp
@@ -41,6 +35,11 @@ class UserInfo(commands.Cog):
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
+        # Startup diagnostics
+        url = os.environ.get("BACKEND_BASE_URL") or "https://app.tacolicensing.org/api/v1"
+        key = os.environ.get("BACKEND_API_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbW9uYTBoY2gwMDAwZzlrYmF4ZGgzbXNmIiwiaWF0IjoxNzc3NzI4Njg3LCJleHAiOjE3NzgzMzM0ODd9.D-phpai1UrADHMRfjHJNvBTOQliS9P2pAXjiOcTig-8"
+        log.info("user_info: BACKEND_BASE_URL = %r", url if url else "(not set)")
+        log.info("user_info: BACKEND_API_KEY  = %s", f"{key[:8]}...(len={len(key)})" if key else "(not set)")
 
     async def cog_unload(self):
         if self.session:
@@ -50,12 +49,12 @@ class UserInfo(commands.Cog):
 
     @property
     def base_url(self) -> str:
-        return ("https://app.tacolicensing.org/api/v1").rstrip("/")
+        return (os.environ.get("BACKEND_BASE_URL") or "").rstrip("/")
 
     @property
     def headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbWtlczZjdGgwMDAwcWdrMHZ0Z284ZWExIiwicm9ibG94SWQiOjU1NDUzNjcxLCJ1c2VybmFtZSI6Imt6ZWlyeG4iLCJpc1RhY29BZG1pbiI6dHJ1ZSwiaWF0IjoxNzc1OTIxNjA3LCJleHAiOjE3NzY1MjY0MDd9.XkHR-PS5ueY1Ot6K0ikXHexPoIpCxCAyvLS3VpE4WOQ'}",
+            "Authorization": f"Bearer {os.environ.get('BACKEND_API_KEY') or ''}",
             "Accept": "application/json",
         }
 
@@ -214,7 +213,7 @@ class UserInfo(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
         if not self.base_url:
-            log.warning("user_info: BACKEND_BASE_URL is not set.")
+            log.warning("user_info: BACKEND_BASE_URL env var is not set.")
             return
         log.info("Fetching backend data for %s (%s)", creator, creator.id)
         await self._fetch_and_send(thread.channel, creator)
