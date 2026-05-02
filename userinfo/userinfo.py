@@ -1,7 +1,14 @@
 """
 user_info - Modmail Plugin
-Fetches player/user data from staff API when a support thread
+Fetches player/user data from your existing staff API when a support thread
 opens, and posts a summary embed for staff to review.
+
+Setup
+-----
+Add these to your Modmail config (.env / config.py):
+
+    BACKEND_BASE_URL   - e.g. https://api.yoursite.com/api/v1
+    BACKEND_API_KEY    - JWT for a staff/master-admin service account
 """
 
 import asyncio
@@ -35,11 +42,7 @@ class UserInfo(commands.Cog):
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
-        # Startup diagnostics
-        url = os.environ.get("BACKEND_BASE_URL") or "https://app.tacolicensing.org/api/v1"
-        key = os.environ.get("BACKEND_API_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbW9uYTBoY2gwMDAwZzlrYmF4ZGgzbXNmIiwiaWF0IjoxNzc3NzI4Njg3LCJleHAiOjE3NzgzMzM0ODd9.D-phpai1UrADHMRfjHJNvBTOQliS9P2pAXjiOcTig-8"
-        log.info("user_info: BACKEND_BASE_URL = %r", url if url else "(not set)")
-        log.info("user_info: BACKEND_API_KEY  = %s", f"{key[:8]}...(len={len(key)})" if key else "(not set)")
+        log.info("user_info: base_url=%s api_key_len=%d", self.BASE_URL, len(self.API_KEY))
 
     async def cog_unload(self):
         if self.session:
@@ -47,14 +50,17 @@ class UserInfo(commands.Cog):
 
     # ── config ────────────────────────────────────────────────────────────────
 
+    BASE_URL = "https://app.tacolicensing.org/api/v1"
+    API_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbW9uYTBoY2gwMDAwZzlrYmF4ZGgzbXNmIiwiaWF0IjoxNzc3NzI4Njg3LCJleHAiOjE3NzgzMzM0ODd9.D-phpai1UrADHMRfjHJNvBTOQliS9P2pAXjiOcTig-8"
+
     @property
     def base_url(self) -> str:
-        return (os.environ.get("BACKEND_BASE_URL") or "").rstrip("/")
+        return self.BASE_URL
 
     @property
     def headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {os.environ.get('BACKEND_API_KEY') or ''}",
+            "Authorization": f"Bearer {self.API_KEY}",
             "Accept": "application/json",
         }
 
