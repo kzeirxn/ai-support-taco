@@ -1,162 +1,292 @@
-# Taco Licensing Dashboard Knowledgebase
+# 🧠 Taco Licensing – AI Knowledgebase
 
-> Purpose: Accurate support for dashboard, marketplace, and admin features.
-> Rule: If unsure, ask one clarifying question and avoid guessing.
+## 📌 Metadata
 
-# The API is https://app.tacolicensing.org and the frontend url for the dashboard is https://licensing.tacogroup.uk
-
----
-
-## 1) Feature Map (Routes → Features)
-
-### Public & Auth
-- **/login**: Login
-- **/register**: Register
-- **/auth/success**: OAuth callback
-
-### Marketplace (Public)
-- **/marketplace**: Marketplace home
-- **/marketplace/workspace/:workspaceId**: Workspace storefront
-- **/marketplace/product/:productId**: Public product detail page
-
-### Workspace Dashboard
-- **/**: Dashboard home
-- **/analytics**: Metrics and charts
-- **/customers**: Customers list
-- **/customers/:userId**: Customer detail
-- **/announcements**: Workspace announcements
-- **/status**: Status Center (API + Discord/Bot)
-- **/documentation**: Documentation
-- **/obfuscator**: Script obfuscation tools
-- **/referrals**: Referral program
-- **/workspace/:workspaceId**: Workspace detail
-- **/workspace/:workspaceId/product/:productId**: Product detail (workspace view)
-
-### Subscription / Billing
-- **/subscription/manage**: Manage subscription
-- **/subscription/success**: Subscription success
-- **/subscription/cancel**: Subscription cancel
-
-### Messaging / Inbox
-- **/messages**: Conversations list
-- **/messages/:conversationId**: Conversation detail
-
-### Admin Console
-- **/admin**: Admin home
-- **/admin/users**: User management
-- **/admin/workspaces**: Workspace management
-- **/admin/products**: Product management
-- **/admin/licenses**: License management
-- **/admin/coin-shop**: Coin shop management
-- **/admin/broadcast**: System broadcast
-- **/admin/announcements**: Admin announcements
-- **/admin/status-updates**: Status updates
-- **/admin/notifications**: Notification settings
-
-### User Settings
-- **/user/settings**: Account settings
-
-### Customer Mode
-- **/**: Customer dashboard
-- **/support**: Customer support page
-- **/messages**: Customer messages
-- **/messages/:conversationId**: Customer conversation detail
-- **/user/settings**: Customer settings
+* **Version:** 1.0
+* **Last Updated:** 2026-05-02
+* **Description:** Structured support knowledgebase for Taco Licensing platform
 
 ---
 
-## 2) Common Tasks (Step‑By‑Step)
+# 🔐 Authentication & Accounts
 
-### Create a Product
-- **Products** → **New Product**
-- Fill name, price, description
-- Save as **Draft** or **Active**
+## How does login work?
 
-### Publish/Hide a Product
-- **Products** → open product → set **Active** or **Archived**
+Users authenticate using a token stored in `localStorage` under `taco_token`.
+If the token becomes invalid or expires, the user is automatically logged out.
 
-### View a Customer
-- **Customers** → select user
-- See purchases, licenses, and status
+## What happens when an account is suspended?
 
-### Reset API Key
-- **Settings** → **API Keys**
-- Click **Regenerate**
-- Old key invalidates immediately
+* Suspended users cannot log in
+* A modal explains the reason and who issued the suspension
+* User must contact support
 
-### Manage Subscription
-- **Subscription** → **Manage**
-- Open billing portal and update payment info
+## Two-Factor Authentication (2FA)
 
----
+### How to enable
 
-## 3) Public vs Workspace vs Admin Views
+* Scan QR code using an authenticator app (Google Authenticator, Authy)
+* Save backup codes securely
 
-### Public Pages
-- Marketplace and product pages are **public** (no login required)
-- Never show owner/admin‑only data
+### Common issues
 
-### Workspace Pages
-- Only accessible after login
-- Scoped to selected workspace
-
-### Admin Pages
-- Admin‑only; for moderation and global operations
+* Invalid code → check device time sync
+* Lost access → use backup codes
+* Disabling requires account password
 
 ---
 
-## 4) Billing & Payments
+# 🧩 Workspaces
 
-- Stripe is the only supported checkout.
-- If checkout fails: ask for error code + last 4 digits.
-- Subscription success/cancel handled by `/subscription/*` routes.
+## What is a workspace?
 
----
+A workspace is the main container for:
 
-## 5) Troubleshooting Guide
+* Products
+* Licenses
+* Members
+* Webhooks
+* Audit logs
 
-### “Product not visible”
-- Check product is **Active**
-- Confirm correct workspace
-- Confirm user is on public marketplace page
+## Workspace actions
 
-### “Checkout failed”
-- Ask for Stripe error code
-- Check browser + device
-- Verify Stripe status page
+* Create, update, delete
+* Suspend / unsuspend
+* Manage members and roles
 
-### “Image not loading”
-- Ask for the image URL
-- Confirm proxy is enabled and used
+## Workspace suspension
 
-### “Access denied (403)”
-- Confirm user role in workspace
-- Ask for Discord role
-
-### “Webhook not firing”
-- Verify webhook URL
-- Check webhook logs
-- Confirm event type is enabled
+* Features are restricted
+* Users receive system notifications
+* Only staff can restore access
 
 ---
 
-## 6) Security & Alerts
+# 📦 Products
 
-- Security Alerts for suspicious scripts or content
-- Manual Review requires staff approval before visible
+## Managing products
+
+* Create, update, delete
+* Link licenses
+* Suspend or restore
+
+## Product status
+
+* **Active** → usable
+* **Suspended** → disabled
 
 ---
 
-## 7) AI Response Style
+# 🔑 Licenses
 
-- Provide one clear next step
-- Ask one clarifying question if missing key info
-- Do not mention AI to customers unless configured
+## License management
+
+* Create individual licenses
+* Bulk create licenses
+* Activate / deactivate
+* Delete or transfer
+
+## Bulk operations
+
+* Bulk create
+* Bulk toggle
+* Bulk delete
 
 ---
 
-## 8) Escalation Rules
+# 👥 Members & Roles
 
-- System‑wide issue → notify staff lead
-- Billing outages → check Stripe status
-- Auth issues → request timestamps + screenshots
+## Member management
+
+* Add/remove members
+* Assign roles
+
+## Permissions
+
+Roles determine:
+
+* Access level
+* Allowed actions
+
+## Common issue
+
+**Permission denied** → insufficient role permissions
+
+---
+
+# 🔔 Notifications
+
+## How notifications work
+
+Tracks:
+
+* License events
+* Product updates
+* Member actions
+* Workspace changes
+
+## Notes
+
+* Grouped by workspace
+* Shows recent activity
+
+---
+
+# 📊 Status Center
+
+## What it monitors
+
+* API health
+* Bot/Discord integration
+* Workspace health
+* Product health
+
+## Status meanings
+
+* 🟢 Online → healthy
+* 🟡 Degraded → partial issues
+* 🔴 Offline → unavailable
+
+---
+
+# 🔌 API & Errors
+
+## Base URL
+
+```
+https://app.tacolicensing.org
+```
+
+## Health check
+
+```
+GET /api/v1/health
+```
+
+## Common errors
+
+* `401` → token expired
+* `STAFF_ACTION_APPROVAL_REQUIRED` → admin approval needed
+* Generic errors → shown via toast
+
+---
+
+# 🧾 Audit Logs
+
+## Tracks
+
+* Workspace changes
+* Product updates
+* License actions
+* Member activity
+
+## Purpose
+
+* Debugging
+* Activity tracking
+* Security auditing
+
+---
+
+# 💬 Messaging
+
+## System messages
+
+Triggered by:
+
+* Workspace suspension
+* Product suspension
+
+## Access
+
+Available via `/messages`
+
+---
+
+# ⚙️ Settings
+
+## Theme
+
+* Light / Dark / Auto
+* Auto follows system preference
+
+---
+
+# 🔍 Command Palette
+
+## Shortcut
+
+```
+CTRL + K
+```
+
+## Features
+
+* Quick navigation
+* Open workspaces
+* Access key pages
+
+---
+
+# 🔐 Sessions & Security
+
+## Session management
+
+* View active sessions
+* Revoke individual sessions
+* Revoke all other sessions
+
+---
+
+# 🔗 Webhooks & Integrations
+
+## Supported events
+
+* Product updates
+* License events
+* Workspace actions
+
+## Actions
+
+* Create webhook
+* Delete webhook
+* Toggle webhook
+
+---
+
+# ❗ Troubleshooting
+
+## API unreachable
+
+Backend may be down or network issue → check Status Center
+
+## Cannot create a license
+
+* Check permissions
+* Ensure product is not suspended
+
+## Product not visible
+
+* Check correct workspace
+* Ensure product is not deleted/suspended
+
+## Permission denied
+
+User role does not allow the action
+
+## Session expired
+
+User must log in again
+
+---
+
+# 🏁 Summary
+
+Taco Licensing is a:
+
+* Multi-workspace SaaS platform
+* Product and license management system
+* Role-based access control system
+* Audit and activity tracking system
+
+---
