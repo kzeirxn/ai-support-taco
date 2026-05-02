@@ -48,16 +48,20 @@ Respond with ONLY the single word. No punctuation, no explanation.
 Message: {message}"""
 
 RESOLUTION_PROMPT = """You are reviewing a support conversation between an AI assistant and a user.
-Based on the conversation history below, has the user's issue been fully resolved?
+Your job is to determine if the user's issue is FULLY resolved.
 
-Respond with ONLY one word:
-- RESOLVED   (the AI provided a clear, complete answer and the user's question appears answered)
-- UNRESOLVED (the issue is still ongoing, unclear, or the user asked a follow-up question)
+Rules:
+- If the user's LAST message contains a question, uncertainty, or asks for more help → UNRESOLVED
+- If the user's LAST message is a thank you, confirmation, or indicates they are satisfied → RESOLVED
+- If the AI just gave an answer but the user has NOT yet responded to confirm it helped → UNRESOLVED
+- When in doubt → UNRESOLVED
 
-Respond with ONLY the single word. No punctuation, no explanation.
+Respond with ONLY one word: RESOLVED or UNRESOLVED. No punctuation, no explanation.
 
 Conversation:
-{history}"""
+{history}
+
+What is the user's last message? Does it contain a question or request? If yes → UNRESOLVED."""
 
 SUMMARY_PROMPT = """You are summarising a support ticket conversation for a staff member who is taking over.
 Write a concise summary (3-5 bullet points max) covering:
@@ -417,7 +421,27 @@ class AIAssistant(commands.Cog):
             pass
 
     async def _check_resolved(self, history: list[dict]) -> bool:
-        """Ask Ollama if the conversation looks resolved. Returns True if RESOLVED."""
+        """Ask Ollama if the conversation looks resolved. Returns True only if clearly RESOLVED."""
+        if not history:
+            return False
+
+        # Fast pre-check: if the last user message looks like a question, skip Ollama entirely
+        last_user = next(
+            (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+        ).lower().strip()
+
+        question_signals = ("?", "how", "what", "why", "when", "where", "who", "which",
+                            "can you", "could you", "is there", "do i", "should i",
+                            "doesn't", "don't", "not working", "still", "help")
+        if any(sig in last_user for sig in question_signals):
+            print(f"[ai_assistant] Resolution pre-check: last user message looks like a question — skipping")
+            return False
+
+        # Also require at least 2 user messages (one question, one confirmation)
+        user_messages = [m for m in history if m["role"] == "user"]
+        if len(user_messages) < 2:
+            return False
+
         history_text = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
         )
@@ -425,7 +449,10 @@ class AIAssistant(commands.Cog):
         result = await self._ollama_post(messages)
         if result is None:
             return False  # Fail safe — don't auto-close if check errors
-        return "RESOLVED" in result.upper()
+
+        resolved = result.strip().upper().startswith("RESOLVED")
+        print(f"[ai_assistant] Resolution Ollama result: '{result.strip()}' → resolved={resolved}")
+        return resolved
 
     async def _check_sentiment(self, message: str) -> str:
         """Ask Ollama to classify sentiment. Returns NEGATIVE, NEUTRAL, or POSITIVE."""
