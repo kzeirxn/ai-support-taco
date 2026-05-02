@@ -50,12 +50,12 @@ class UserInfo(commands.Cog):
 
     @property
     def base_url(self) -> str:
-        return self.bot.config.get("BACKEND_BASE_URL", "https://app.tacolicensing.org/api/v1").rstrip("/")
+        return (self.bot.config.get("BACKEND_BASE_URL") or "https://app.tacolicensing.org/api/v1").rstrip("/")
 
     @property
     def headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {self.bot.config.get('BACKEND_API_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbWtlczZjdGgwMDAwcWdrMHZ0Z284ZWExIiwicm9ibG94SWQiOjU1NDUzNjcxLCJ1c2VybmFtZSI6Imt6ZWlyeG4iLCJpc1RhY29BZG1pbiI6dHJ1ZSwiaWF0IjoxNzc1OTIxNjA3LCJleHAiOjE3NzY1MjY0MDd9.XkHR-PS5ueY1Ot6K0ikXHexPoIpCxCAyvLS3VpE4WOQ')}",
+            "Authorization": f"Bearer {self.bot.config.get('BACKEND_API_KEY') or 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbWtlczZjdGgwMDAwcWdrMHZ0Z284ZWExIiwicm9ibG94SWQiOjU1NDUzNjcxLCJ1c2VybmFtZSI6Imt6ZWlyeG4iLCJpc1RhY29BZG1pbiI6dHJ1ZSwiaWF0IjoxNzc1OTIxNjA3LCJleHAiOjE3NzY1MjY0MDd9.XkHR-PS5ueY1Ot6K0ikXHexPoIpCxCAyvLS3VpE4WOQ'}",
             "Accept": "application/json",
         }
 
@@ -230,7 +230,7 @@ class UserInfo(commands.Cog):
         Defaults to the current thread's recipient.
         """
         if user is None:
-            thread = self.bot.threads.find_by_channel(ctx.channel)
+            thread = await self.bot.threads.find(channel=ctx.channel)
             if thread is None:
                 await ctx.send("Provide a user or run this inside a Modmail thread.")
                 return
