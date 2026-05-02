@@ -221,11 +221,12 @@ class UserInfo(commands.Cog):
         if not self.base_url:
             log.warning("user_info: BACKEND_BASE_URL env var is not set.")
             return
-        if creator is None:
-            log.warning("user_info: creator is None, skipping.")
+        recipient = thread.recipient or creator
+        if recipient is None:
+            log.warning("user_info: could not determine recipient, skipping.")
             return
-        log.info("Fetching backend data for %s (%s)", creator, creator.id)
-        await self._fetch_and_send(thread.channel, creator)
+        log.info("Fetching backend data for %s (%s)", recipient, recipient.id)
+        await self._fetch_and_send(thread.channel, recipient)
 
     # ── manual command ────────────────────────────────────────────────────────
 
