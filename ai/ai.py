@@ -98,7 +98,7 @@ class AIAssistant(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.ollama_url = os.environ.get("OLLAMA_URL", "https://ai.tacogroup.uk")
-        self.ollama_model = os.environ.get("OLLAMA_MODEL", "gavtoken/minimax:latest")
+        self.ollama_model = os.environ.get("OLLAMA_MODEL", "gemma4:e2b")
         # Role ID to ping when escalating (set ESCALATION_ROLE_ID in .env)
         self.escalation_role_id: int | None = int(r) if (r := os.environ.get("ESCALATION_ROLE_ID")) else 1401301393767141541
         # Tracks active AI sessions: thread channel_id -> list of message dicts
