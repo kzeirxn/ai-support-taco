@@ -7,14 +7,16 @@ while a ticket is unclaimed, attempting to resolve issues before a mod steps in.
 When a mod claims the thread, the AI stops responding immediately.
 
 Ported from the Taco Licensing version. It now answers about Evalyn, from
-support_knowledge.md in this folder. If the `userinfo` or `evalyn` plugin is
+the knowledge base at the bottom of this file (KNOWLEDGE_BASE), sent whole
+with every reply. Edit it there. If the `userinfo` or `evalyn` plugin is
 installed, it also reads the user's Evalyn account (Roblox linked? suspended?
 which workspaces?) so it can answer "why won't my group sync" without asking
 first. No extra setup: it borrows that plugin's lookup and token.
 
 Built to cope with a slow, CPU-only Ollama:
-  - Only the knowledge-base sections that match the question are sent, not
-    the whole file, so the prompt fits a 4096-token context and reads fast.
+  - The knowledge base comes first in the prompt and never changes, so Ollama
+    can reuse the work of reading it instead of starting over each ticket.
+    The context is raised to 8192 tokens so all of it fits.
   - Replies are streamed, so a proxy in front of Ollama sees data arriving
     and doesn't cut a slow answer off at its timeout (~90s on openresty).
   - One request at a time from this bot. Extras wait here, where waiting
@@ -39,12 +41,10 @@ still win if they're set on the host.
 import asyncio
 import contextlib
 import json
-import math
 import os
 import re
 import time
 import traceback
-from collections import Counter
 
 import aiohttp
 import discord
@@ -58,7 +58,7 @@ BASE_SYSTEM_PROMPT = """You are a helpful AI support assistant for Evalyn, a fre
 A user has opened a support ticket and no staff member has claimed it yet.
 Your job is to:
 1. Greet the user warmly and acknowledge their issue.
-2. Use the knowledge base excerpts below to try to resolve their issue accurately.
+2. Use the knowledge base below to try to resolve their issue accurately.
 3. If unsure, ask a clarifying question. Do NOT guess or make up answers, menu paths, or features.
 4. Let them know a staff member will follow up if you cannot fully resolve it.
 5. Links: the dashboard is {base_url}, the guides are {base_url}/docs, and in-app support tickets are at {base_url}/tickets.
@@ -68,23 +68,17 @@ If the issue requires account-specific action only staff can perform, say so cle
 Never ask for passwords, PINs, Open Cloud keys, bot tokens or API secrets, and tell the user not to post them.
 Taco Licensing is no longer supported. If someone asks about licenses, products or TacoCoins, say so politely and offer help with Evalyn instead.
 
+--- KNOWLEDGE BASE ---
+{knowledge}
+--- END KNOWLEDGE BASE ---
+
 --- ABOUT THIS USER ---
 {account}
 --- END ABOUT THIS USER ---
 Use this to tailor your answer (for example, a user with no Roblox account linked can't have shifts tracked).
 Don't recite it back, and don't share internal details beyond what the user needs.
 If their account is suspended, don't speculate about why. Tell them they can appeal at {base_url}/suspended/appeal and that staff will follow up.
-
---- KNOWLEDGE BASE EXCERPTS ---
-These are the parts of Evalyn's knowledge base that match this conversation.
-The full knowledge base also covers: {topics}.
-If the excerpts don't answer the question, ask a clarifying question or say a staff member will help.
-
-{knowledge}
---- END KNOWLEDGE BASE EXCERPTS ---
 """
-
-KNOWLEDGE_FILE = os.path.join(os.path.dirname(__file__), "support_knowledge.md")
 
 SENTIMENT_PROMPT = """You are a sentiment classifier. Analyse the user message below and respond with ONLY one word:
 - NEGATIVE  (user is angry, frustrated, upset, threatening, or using strong negative language)
@@ -126,8 +120,7 @@ Conversation:
 AUTO_CLOSE_DELAY = 120   # seconds to wait for user confirmation before closing
 OLLAMA_TIMEOUT   = 120   # seconds Ollama may send nothing (loading, reading the prompt) before giving up
 REPLY_TOKENS     = 400   # longest reply the model may write
-KB_BUDGET_CHARS  = 3500  # knowledge-base text per prompt, ~900 tokens
-KB_MAX_SECTIONS  = 5
+OLLAMA_CONTEXT   = 8192  # tokens; the full knowledge base alone is ~3,800, past Ollama's 4096 default
 HISTORY_CHARS    = 4000  # conversation text per prompt
 
 # Staff running these in a thread is looking something up, not claiming it.
@@ -144,159 +137,16 @@ SETTINGS = {
 NO_ACCOUNT_INFO = "(No account information available.)"
 
 
-# ----------------------------------------------------------------------
-# Knowledge base: split into sections, send only the ones that match
-# ----------------------------------------------------------------------
+def _build_system_prompt(base_url: str, account: str | None) -> str:
+    """Instructions and the whole knowledge base, then this user's account.
 
-STOPWORDS = frozenset("""
-a an and are as at be been but by can could do does dont for from get got had has have how i if in into is it its
-just me my no not of on or our please so some still that the their them then there they this to too up us was we
-what when where which who why will with would you your hi hello hey thanks thank help need want im ive cant cannot
-wont isnt doesnt didnt also any all about
-""".split())
-
-# Words people type -> words the knowledge base uses.
-SYNONYMS = {
-    "login": "sign", "log": "sign", "logged": "sign", "signin": "sign", "password": "sign",
-    "bot": "discord", "bots": "discord", "guild": "discord", "slash": "discord", "intent": "discord",
-    "command": "discord", "commands": "discord",
-    "script": "handler", "studio": "handler", "http": "handler", "game": "handler", "ingame": "handler",
-    "track": "shift", "tracking": "shift", "clock": "shift", "hours": "shift", "afk": "shift",
-    "banned": "ban", "kick": "moderation", "warn": "logbook", "warning": "logbook",
-    "rank": "role", "ranks": "role", "promote": "role", "promotion": "role", "demote": "role",
-    "access": "permission", "denied": "permission",
-    "suspension": "suspend", "appeal": "suspend",
-    "group": "workspace", "groups": "workspace",
-    "email": "mail", "domain": "mail", "mailbox": "mail",
-    "loa": "leave", "absence": "leave",
-    "event": "session", "events": "session", "training": "session", "trainings": "session",
-    "license": "licensing", "licenses": "licensing", "tacocoins": "licensing", "coins": "licensing",
-    "product": "licensing", "products": "licensing",
-    "verify": "verified", "verification": "verified", "partner": "tier", "tiers": "tier",
-    "link": "linking", "unlink": "linking", "connect": "linking",
-}
-
-_KB_CACHE: dict = {"mtime": None}
-
-
-def _stem(word: str) -> str:
-    for suffix, min_len in (("ing", 6), ("ed", 5), ("s", 4)):
-        if word.endswith(suffix) and len(word) >= min_len:
-            return word[: -len(suffix)]
-    return word
-
-
-def _terms(text: str, expand: bool = False) -> list[str]:
-    words = [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 1 and w not in STOPWORDS]
-    if expand:
-        words += [SYNONYMS[w] for w in words if w in SYNONYMS]
-    return [_stem(w) for w in words]
-
-
-def _clean_heading(text: str) -> str:
-    return re.sub(r"^[^\w]+", "", text).strip()  # drop the leading emoji
-
-
-def _parse_kb(text: str) -> dict:
-    """Split the markdown into `# Topic › ## Question` sections."""
-    sections, topics = [], []
-    h1 = h2 = None
-    buf: list[str] = []
-
-    def flush():
-        body = "\n".join(buf).strip()
-        if not (body and h1) or "knowledgebase" in h1.lower() or h1.lower() == "summary":
-            return
-        title = f"{h1} › {h2}" if h2 else h1
-        sections.append({
-            "title": title,
-            "text": f"## {title}\n{body}",
-            "terms": Counter(_terms(f"{title}\n{body}")),
-            "head": set(_terms(title)),
-        })
-
-    for line in text.splitlines():
-        if line.startswith("# "):
-            flush(); buf = []
-            h1, h2 = _clean_heading(line[2:]), None
-            if "knowledgebase" not in h1.lower() and h1.lower() != "summary" and h1 not in topics:
-                topics.append(h1)
-        elif line.startswith("## "):
-            flush(); buf = []
-            h2 = _clean_heading(line[3:])
-        elif line.strip() != "---":
-            buf.append(line)
-    flush()
-
-    # The "What is Evalyn?" intro (links, what it is) goes in every prompt.
-    intro = next((s for s in sections if s["title"].lower().startswith("what is evalyn")), None)
-    rest = [s for s in sections if s is not intro]
-    return {
-        "intro": intro["text"] if intro else "",
-        "sections": rest,
-        "topics": ", ".join(t for t in topics if not t.lower().startswith("what is evalyn")),
-    }
-
-
-def _knowledge() -> dict | None:
-    """The parsed knowledge base, re-read only when the file changes."""
-    try:
-        mtime = os.path.getmtime(KNOWLEDGE_FILE)
-    except OSError:
-        return None
-    if _KB_CACHE.get("mtime") != mtime:
-        with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-            _KB_CACHE.clear()
-            _KB_CACHE.update(_parse_kb(f.read()), mtime=mtime)
-    return _KB_CACHE
-
-
-def _select_sections(sections: list[dict], query: str) -> list[dict]:
-    """The best-matching sections for the query, within the size budget, in file order."""
-    wanted = set(_terms(query, expand=True))
-    if not wanted or not sections:
-        return []
-    df = Counter(t for s in sections for t in s["terms"])
-    n = len(sections)
-    scored = []
-    for i, s in enumerate(sections):
-        score = 0.0
-        for t in wanted:
-            if t in s["terms"]:
-                idf = math.log(1 + n / df[t])
-                score += idf * (min(s["terms"][t], 3) + (3 if t in s["head"] else 0))
-        if score > 0:
-            scored.append((score, i))
-    if not scored:
-        return []
-    scored.sort(reverse=True)
-    floor = scored[0][0] * 0.25  # drop sections that only brushed one common word
-    chosen, used = [], 0
-    for score, i in scored:
-        if score < floor or len(chosen) >= KB_MAX_SECTIONS:
-            break
-        size = len(sections[i]["text"])
-        if used + size > KB_BUDGET_CHARS:
-            continue
-        chosen.append(i)
-        used += size
-    return [sections[i] for i in sorted(chosen)]
-
-
-def _build_system_prompt(base_url: str, account: str | None, query: str) -> str:
-    kb = _knowledge()
-    if kb is None:
-        print(f"[ai_assistant] Knowledge base not found at {KNOWLEDGE_FILE}")
-        knowledge, topics = "(No knowledge base found. Answer using general knowledge only.)", "nothing else"
-    else:
-        picked = _select_sections(kb["sections"], query)
-        knowledge = "\n\n".join([kb["intro"]] + [s["text"] for s in picked]).strip()
-        topics = kb["topics"] or "nothing else"
+    Everything before ABOUT THIS USER is identical for every ticket, so Ollama
+    can reuse the work of reading it instead of re-reading ~4,000 tokens.
+    """
     return BASE_SYSTEM_PROMPT.format(
         base_url=base_url,
+        knowledge=KNOWLEDGE_BASE,
         account=account or NO_ACCOUNT_INFO,
-        topics=topics,
-        knowledge=knowledge,
     )
 
 
@@ -807,11 +657,10 @@ class AIAssistant(commands.Cog):
         return "NEUTRAL", None
 
     async def _call_ollama(self, history: list[dict], account: str | None = None) -> tuple[str | None, str | None]:
-        """The reply to the conversation: system prompt with matching knowledge, plus recent history."""
+        """The reply to the conversation: system prompt with the full knowledge base, plus recent history."""
         await self._ensure_config()
         recent = _recent(history)
-        query = " ".join([m["content"] for m in recent if m["role"] == "user"][-2:])
-        system = _build_system_prompt(self.evalyn_url, account, query)
+        system = _build_system_prompt(self.evalyn_url, account)
         print(f"[ai_assistant] Calling Ollama at {self.ollama_url} with model {self.ollama_model} "
               f"({len(system)} chars of system prompt)")
         return await self._ollama_post([{"role": "system", "content": system}] + recent, num_predict=REPLY_TOKENS)
@@ -828,8 +677,10 @@ class AIAssistant(commands.Cog):
         """
         await self._ensure_config()
         payload: dict = {"model": self.ollama_model, "messages": messages, "stream": True}
+        # Same context size on every call: a different one makes Ollama reload the model.
+        payload["options"] = {"num_ctx": OLLAMA_CONTEXT}
         if num_predict:
-            payload["options"] = {"num_predict": num_predict}
+            payload["options"]["num_predict"] = num_predict
 
         lock = self._ollama_lock if use_lock else contextlib.nullcontext()
         async with lock:
@@ -964,7 +815,7 @@ class AIAssistant(commands.Cog):
             f"🤖 **AI Assistant Status**\n"
             f"Active (unclaimed) threads: **{active}**\n"
             f"Claimed (AI silenced) threads: **{claimed}**\n"
-            f"Knowledge base: **{'loaded' if os.path.exists(KNOWLEDGE_FILE) else 'MISSING'}**\n"
+            f"Knowledge base: **built in, {len(KNOWLEDGE_BASE):,} characters, sent whole**\n"
             f"Evalyn account context: **{'on' if (self.bot.get_cog('UserInfo') or self.bot.get_cog('Evalyn')) else 'off (install userinfo or evalyn)'}**\n"
             f"Model: `{self.ollama_model}` at `{self.ollama_url}`\n"
             f"{ollama}",
@@ -1063,6 +914,295 @@ class AIAssistant(commands.Cog):
         if task:
             task.cancel()
         await ctx.send("🤖 AI Assistant has been silenced in this thread.")
+
+
+# ----------------------------------------------------------------------
+# Knowledge base. Sent in full with every reply; edit it here.
+# ----------------------------------------------------------------------
+
+KNOWLEDGE_BASE = """
+# 🧠 Evalyn – AI Knowledgebase
+
+## 📌 Metadata
+
+* **Version:** 2.0
+* **Last Updated:** 2026-11-06
+* **Description:** Support knowledgebase for Evalyn, Taco's staff management platform for Roblox groups. Replaces the Taco Licensing knowledgebase. Licensing is no longer supported.
+
+---
+
+# 🧾 What is Evalyn?
+
+Evalyn is a **free** staff management platform for Roblox groups: applications, shifts, sessions, moderation, activity tracking and Open Cloud integration in one place.
+
+* Dashboard: `https://evalyn.tacogroup.uk`
+* Guides: `https://evalyn.tacogroup.uk/docs`
+* In-app support tickets: `https://evalyn.tacogroup.uk/tickets`
+
+## Taco Licensing
+
+Taco Licensing (licenses, products, TacoCoins) is **no longer supported**. Staff can't restore licensing accounts or features. Offer help with Evalyn instead.
+
+---
+
+# 🔐 Signing in & Accounts
+
+## How do I sign in?
+
+Three ways on the sign-in page:
+
+* **Continue with Discord**
+* **Continue with Roblox**
+* **Sign in with PIN**: fast access without Discord or Roblox, for staff who have set a 6-digit PIN in a workspace. Search for the workspace, then enter the PIN.
+
+## Linking accounts
+
+**Account → Linking** (`/account/linking`) connects Discord and Roblox to one Evalyn account.
+
+* **Discord** is needed for bot commands, DMs and notifications. Without it Evalyn can't reach you, and features that DM will say so.
+* **Roblox** is needed to track shifts and receive group role changes. Linking requires verifying with a code.
+* "This Discord account is already linked to another user" means that Discord is on a different Evalyn account. Sign in with it and unlink it there, or contact staff.
+* Unlinking Roblox means verifying again to relink. Workspaces that require a linked account lock until you do.
+
+## Sign-in history & security
+
+**Account → Security** (`/account/security`) shows your last 25 sign-in attempts and how you log in.
+
+## Multiple accounts
+
+You can stay signed in to several Evalyn accounts and switch between them. Signing out only signs out the current account.
+
+## Suspended accounts
+
+* A suspended account can't sign in. The sign-in page says the account is suspended.
+* They can ask the team to lift it at `/suspended/appeal`.
+* One pending appeal at a time. Appeals are 30 to 2000 characters.
+* After a denial they can see the team's reply and must wait **30 days** before appealing again.
+* The AI can't lift or explain suspensions. Staff decide.
+
+---
+
+# 🧩 Workspaces
+
+## What is a workspace?
+
+A workspace is one Roblox group on Evalyn. It holds that group's staff, roles, shifts, sessions, moderation, forms and settings.
+
+## Creating a workspace
+
+* Sign in, then enter your **Roblox group id**.
+* You must be **rank 250+** in the group.
+* The group id becomes the address: group `1234567` lives at `/w/1234567`. It can't be changed, so links stay permanent.
+* Creating it pulls in the group's name, icon and member count.
+* An **Open Cloud key** is optional. It's only needed for Evalyn to *change* things in the group (rank changes, game syncing), not to read it.
+
+## First things to set up
+
+1. **Settings → General → Time zone**. Set this before scheduling anything. Recurring sessions, quota periods and activity resets use it.
+2. **Developer → Scripts & Modules → Generate script** (the Roblox handler).
+3. **Settings → Discord** (connect a bot).
+4. **Settings → Access → Invitations** (create a join link, or sync members from the group).
+5. **Settings → Features** switches whole areas on and off. Turning one off hides it for everyone and removes its Discord commands, but deletes nothing. Switching it back restores it.
+
+## Sidebar
+
+Pages are grouped as: Dashboard, People (Staff, Teams, Logbook, Recommendations), Insights (Activity, Performance, Leaderboard, Quotas, Reports), Operations (Shifts, Sessions, Calendar), Moderation (Live Panel, Bans, Chat Logs, Games), Communications (Announcements, Group Wall, Messages, Mail), Forms & Requests (Forms, Notices, Approvals), Resources (Knowledge, Documents, Policies, Alliances), Configuration (Settings, Audit Log, API Keys, Scripts & Modules, Configs, External Rankings).
+
+A page missing from the sidebar usually means the feature is switched off in **Settings → Features**, or the user's role lacks the permission to view it.
+
+## Workspace tiers
+
+Standard, Verified, Partner and Master. Some tiers include **priority support**. Owners can request verification from workspace settings. Staff decide.
+
+## Workspace suspension
+
+A suspended workspace is restricted until platform staff restore it. Only staff can lift it.
+
+---
+
+# 🎮 The Roblox handler script
+
+A server script in your game that talks to Evalyn. Without it, Evalyn knows nothing about what happens in-game.
+
+## It handles
+
+* Shifts (clock in/out)
+* Bans and blacklists (enforced on join)
+* Activity tracking, including AFK detection
+* Chat logging
+* In-game commands: `/ban`, `/warn`, `/blacklist`, `/status`
+
+## Installing
+
+1. **Developer → Scripts & Modules → Generate script**
+2. Paste it into a Script in `ServerScriptService`
+3. Roblox Studio → **Game Settings → Security → Allow HTTP Requests** on
+
+## Important
+
+* **Generating a new script invalidates the old one.** Every game still running an old copy stops reporting until updated.
+* Only the **workspace owner** can generate it.
+* The script is a copy, not a live connection. New handler features need a regenerate and reinstall.
+
+## Not working?
+
+* **Nothing arrives**: Allow HTTP Requests is off. This is the usual cause.
+* **Worked, then stopped**: the script was regenerated somewhere else. Reinstall the current one.
+* **Shifts work but chat logs are empty**: older handlers only listened to legacy chat. Regenerate and reinstall.
+
+---
+
+# 🤖 Discord
+
+## Two ways to connect (only one is needed)
+
+**Official Evalyn bot** (simplest):
+
+1. **Settings → Discord → Server / Guild**: set your server id first. Linking without it does nothing.
+2. **Official Evalyn Bot → Link this workspace**
+3. **Add to server** and authorise it
+
+It only registers commands for features that are switched on.
+
+**Your own bot**: **Settings → Discord → Discord Bot**, paste a bot token and set the server id. Your own bot takes precedence over the official one.
+
+## Bot shows "Not connected"
+
+The panel shows the reason. Most often the bot needs **Server Members Intent** enabled in the Discord developer portal.
+
+## Which channel gets what
+
+* **Notification Channel**: general events (forms, logbook, bans, announcements)
+* **Activity Feed Channel**: the same general events, plus shift start/end
+* **Welcome Channel**: new member welcomes only
+* **Session board channels**: per session type, in **Settings → Features → Sessions**
+
+If both Notification and Activity Feed are set, events appear in both. That's intended. Clear one to get events in one place. Setting both to the same channel sends once.
+
+## Finding ids
+
+Discord → **Settings → Advanced → Developer Mode**, then right-click a server, channel or role → **Copy ID**. Evalyn only accepts ids, not names.
+
+---
+
+# 👥 Roles & Permissions
+
+* If the Roblox group is connected, a member's **rank** is their group rank.
+* Members can hold **additional roles** inside Evalyn. Their effective rank is the highest. Removing an extra role drops them back to their group rank.
+* **Settings → Access → Custom roles** defines what each role can do.
+* A role can have a **promotion ceiling** limiting how high its holders can promote others.
+* Articles, folders and categories can have their own access rules, like a rank floor.
+* With **Approvals** on, some actions (like rank changes) wait for a reviewer.
+
+## "Permission denied" / can't see a page
+
+The user's role lacks that permission, or the feature is switched off. A workspace admin fixes this in **Settings → Access → Custom roles** or **Settings → Features**. Evalyn support staff can't change a workspace's roles for them.
+
+## Platform staff in a workspace
+
+Evalyn staff can open a workspace to help with support. A banner says so and every visit is recorded. They aren't members and aren't counted as such.
+
+---
+
+# ⏱️ Shifts
+
+* Clock in **from the game** (the handler, accurate) or **from the dashboard** (Shifts page button).
+* Duration runs from when they joined the game to clock-out, stored in whole minutes. A shift under a minute records as zero, which is correct.
+* AFK time still belongs to the shift but is marked.
+* Shifts left running (game crash) are closed automatically after an implausibly long time.
+* "4m" means four minutes, "4h" four hours. A few minutes shown as that many *hours* is a display bug, not bad data.
+
+---
+
+# 📅 Sessions
+
+A session is any scheduled event: shift, training, meeting, raid.
+
+* **Settings → Features → Sessions** defines your own **types**, **roles** (with slots) and **statuses**.
+* A status label can be renamed freely. Its **behaviour** (Upcoming, Running now, Finished, Called off) is what Evalyn acts on.
+* Scheduled, In Progress and Completed can be renamed but not deleted.
+* **One person holds one role per session.** Unclaim the first role to take another.
+* **Claiming** a role means helping run it. **Registering** means attending. You can do both.
+* Times are entered in your own local time and shown correctly to everyone in their own timezone.
+* Managers (`manage_sessions`) can remove people from slots and change status. Subscribers get a DM on status changes.
+
+---
+
+# 📊 Activity, Quotas & Leaderboard
+
+* **Activity**: what the handler reports (joins, leaves, AFK), plus Discord message counts if enabled.
+* **Quotas**: requirements (shift hours, sessions, messages) per period, evaluated on a schedule. Evalyn never demotes anyone automatically.
+* **Leaderboard**: ranked by shift hours, sessions attended or activity hours, with optional rank and time filters.
+* **Leave of absence**: excludes someone from quota failure. It can tag them in Discord with a role and nickname prefix, reapplied on a schedule.
+
+---
+
+# 🛡️ Moderation
+
+* **Bans** stop someone entering your games. Issued from the dashboard or in-game `/ban`. Unbanning is recorded, not deleted. Can sync to Discord if enabled.
+* **Blacklists** are checked on join alongside bans (`/blacklist`).
+* **Logbook**: promotions, warnings, commendations and notes on a person. Entries can require acknowledgement.
+* **Notices**: workspace-wide statements like suspensions, leave or formal warnings.
+
+---
+
+# ✉️ Evalyn Mail
+
+* Free for every workspace.
+* Use an Evalyn subdomain address, or a custom domain after DNS verification.
+* Disabling mail never deletes mailboxes.
+
+---
+
+# 🎫 Getting help
+
+* **Guides**: `/docs` (getting started, Discord, handler, sessions, shifts, roles, moderation).
+* **Help articles**: `/knowledge`.
+* **In-app tickets**: `/tickets`. Tied to the Evalyn account, with a notification on each reply.
+* Screenshots and exact steps help staff answer in one go.
+
+---
+
+# ❗ Troubleshooting
+
+## Can't sign in
+
+* Try the other method (Discord or Roblox) linked to the same account.
+* "Account suspended" → appeal at `/suspended/appeal`.
+* Signed up with a different Discord? They may have two Evalyn accounts. Staff can check.
+
+## Group/workspace not showing
+
+* Check they're signed in to the right Evalyn account.
+* To create one they need rank 250+ in the group.
+* They may own it but not be a member. Staff can see this.
+
+## Shifts or activity not tracking
+
+* The handler isn't installed, Allow HTTP Requests is off, or the script was regenerated.
+* The staff member's Roblox account isn't linked.
+
+## Discord bot not responding
+
+* Server id not set in **Settings → Discord**.
+* Server Members Intent off (own bot).
+* The feature for that command is switched off.
+
+## Rank changes not applying in Roblox
+
+* An Open Cloud key is needed for Evalyn to change ranks.
+* With Approvals on, the change may be waiting for review.
+
+## Never ask for secrets
+
+Passwords, PINs, Open Cloud keys, bot tokens and handler secrets must never be posted in a ticket. If one was posted, tell the user to rotate it.
+
+---
+
+# 🏁 Summary
+
+Evalyn is a free, multi-workspace staff management platform for Roblox groups: staff, ranks and roles, shifts and activity, sessions, moderation, Discord integration and forms, one workspace per Roblox group.
+"""
 
 
 async def setup(bot):
