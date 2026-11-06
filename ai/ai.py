@@ -12,12 +12,21 @@ installed, it also reads the user's Evalyn account (Roblox linked? suspended?
 which workspaces?) so it can answer "why won't my group sync" without asking
 first. No extra setup: it borrows that plugin's lookup and token.
 
+Built to cope with a slow, CPU-only Ollama:
+  - Only the knowledge-base sections that match the question are sent, not
+    the whole file, so the prompt fits a 4096-token context and reads fast.
+  - Replies are streamed, so a proxy in front of Ollama sees data arriving
+    and doesn't cut a slow answer off at its timeout (~90s on openresty).
+  - One request at a time from this bot. Extras wait here, where waiting
+    doesn't count against that proxy timeout.
+  - When Ollama fails, the ticket gets one note saying why, not silence.
+
 Setup, from Discord (bot owner only, saved in Modmail's database, so it works
 on Docker installs with no .env to edit). Everything has a default, so this
 is only for changing them:
   ?ai_config                                  show current settings
   ?ai_config ollama_url https://ai.tacogroup.uk
-  ?ai_config ollama_model gemma4:e2b
+  ?ai_config ollama_model qwen3.5:4b
   ?ai_config evalyn_url https://evalyn.tacogroup.uk   (links the AI gives out)
   ?ai_config escalation_role @Support                 (or a role id, or none)
   ?ai_config <setting> reset                          back to the default
@@ -28,8 +37,14 @@ still win if they're set on the host.
 """
 
 import asyncio
+import contextlib
+import json
+import math
 import os
 import re
+import time
+import traceback
+from collections import Counter
 
 import aiohttp
 import discord
@@ -43,11 +58,11 @@ BASE_SYSTEM_PROMPT = """You are a helpful AI support assistant for Evalyn, a fre
 A user has opened a support ticket and no staff member has claimed it yet.
 Your job is to:
 1. Greet the user warmly and acknowledge their issue.
-2. Use the knowledge base below to try to resolve their issue accurately.
+2. Use the knowledge base excerpts below to try to resolve their issue accurately.
 3. If unsure, ask a clarifying question. Do NOT guess or make up answers, menu paths, or features.
 4. Let them know a staff member will follow up if you cannot fully resolve it.
 5. Links: the dashboard is {base_url}, the guides are {base_url}/docs, and in-app support tickets are at {base_url}/tickets.
-Keep your replies concise, friendly, and professional.
+Keep replies under 120 words, friendly, and professional.
 Do NOT pretend to be a human staff member. You are an AI assistant.
 If the issue requires account-specific action only staff can perform, say so clearly.
 Never ask for passwords, PINs, Open Cloud keys, bot tokens or API secrets, and tell the user not to post them.
@@ -60,9 +75,13 @@ Use this to tailor your answer (for example, a user with no Roblox account linke
 Don't recite it back, and don't share internal details beyond what the user needs.
 If their account is suspended, don't speculate about why. Tell them they can appeal at {base_url}/suspended/appeal and that staff will follow up.
 
---- KNOWLEDGE BASE ---
+--- KNOWLEDGE BASE EXCERPTS ---
+These are the parts of Evalyn's knowledge base that match this conversation.
+The full knowledge base also covers: {topics}.
+If the excerpts don't answer the question, ask a clarifying question or say a staff member will help.
+
 {knowledge}
---- END KNOWLEDGE BASE ---
+--- END KNOWLEDGE BASE EXCERPTS ---
 """
 
 KNOWLEDGE_FILE = os.path.join(os.path.dirname(__file__), "support_knowledge.md")
@@ -104,9 +123,12 @@ Be brief and factual. Use plain text, no markdown headers.
 Conversation:
 {history}"""
 
-AUTO_CLOSE_DELAY = 120  # seconds to wait for user confirmation before closing
-OLLAMA_TIMEOUT   = 120  # seconds, the model can be slow on first response
-OLLAMA_RETRIES   = 2    # number of retries on timeout before giving up
+AUTO_CLOSE_DELAY = 120   # seconds to wait for user confirmation before closing
+OLLAMA_TIMEOUT   = 120   # seconds Ollama may send nothing (loading, reading the prompt) before giving up
+REPLY_TOKENS     = 400   # longest reply the model may write
+KB_BUDGET_CHARS  = 3500  # knowledge-base text per prompt, ~900 tokens
+KB_MAX_SECTIONS  = 5
+HISTORY_CHARS    = 4000  # conversation text per prompt
 
 # Staff running these in a thread is looking something up, not claiming it.
 PASSIVE_COMMANDS = {"userinfo", "evalyn", "ai_status", "ai_config"}
@@ -114,7 +136,7 @@ PASSIVE_COMMANDS = {"userinfo", "evalyn", "ai_status", "ai_config"}
 # What `?ai_config` can change: setting -> (env var that overrides it, default).
 SETTINGS = {
     "ollama_url":      ("OLLAMA_URL", "https://ai.tacogroup.uk"),
-    "ollama_model":    ("OLLAMA_MODEL", "gemma4:e2b"),
+    "ollama_model":    ("OLLAMA_MODEL", "qwen3.5:4b"),
     "evalyn_url":      ("EVALYN_BASE_URL", "https://evalyn.tacogroup.uk"),
     "escalation_role": ("ESCALATION_ROLE_ID", "1401301393767141541"),
 }
@@ -122,19 +144,183 @@ SETTINGS = {
 NO_ACCOUNT_INFO = "(No account information available.)"
 
 
-def _load_system_prompt(base_url: str, account: str | None) -> str:
-    """Load the knowledge base and the user's account summary into the system prompt."""
+# ----------------------------------------------------------------------
+# Knowledge base: split into sections, send only the ones that match
+# ----------------------------------------------------------------------
+
+STOPWORDS = frozenset("""
+a an and are as at be been but by can could do does dont for from get got had has have how i if in into is it its
+just me my no not of on or our please so some still that the their them then there they this to too up us was we
+what when where which who why will with would you your hi hello hey thanks thank help need want im ive cant cannot
+wont isnt doesnt didnt also any all about
+""".split())
+
+# Words people type -> words the knowledge base uses.
+SYNONYMS = {
+    "login": "sign", "log": "sign", "logged": "sign", "signin": "sign", "password": "sign",
+    "bot": "discord", "bots": "discord", "guild": "discord", "slash": "discord", "intent": "discord",
+    "command": "discord", "commands": "discord",
+    "script": "handler", "studio": "handler", "http": "handler", "game": "handler", "ingame": "handler",
+    "track": "shift", "tracking": "shift", "clock": "shift", "hours": "shift", "afk": "shift",
+    "banned": "ban", "kick": "moderation", "warn": "logbook", "warning": "logbook",
+    "rank": "role", "ranks": "role", "promote": "role", "promotion": "role", "demote": "role",
+    "access": "permission", "denied": "permission",
+    "suspension": "suspend", "appeal": "suspend",
+    "group": "workspace", "groups": "workspace",
+    "email": "mail", "domain": "mail", "mailbox": "mail",
+    "loa": "leave", "absence": "leave",
+    "event": "session", "events": "session", "training": "session", "trainings": "session",
+    "license": "licensing", "licenses": "licensing", "tacocoins": "licensing", "coins": "licensing",
+    "product": "licensing", "products": "licensing",
+    "verify": "verified", "verification": "verified", "partner": "tier", "tiers": "tier",
+    "link": "linking", "unlink": "linking", "connect": "linking",
+}
+
+_KB_CACHE: dict = {"mtime": None}
+
+
+def _stem(word: str) -> str:
+    for suffix, min_len in (("ing", 6), ("ed", 5), ("s", 4)):
+        if word.endswith(suffix) and len(word) >= min_len:
+            return word[: -len(suffix)]
+    return word
+
+
+def _terms(text: str, expand: bool = False) -> list[str]:
+    words = [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 1 and w not in STOPWORDS]
+    if expand:
+        words += [SYNONYMS[w] for w in words if w in SYNONYMS]
+    return [_stem(w) for w in words]
+
+
+def _clean_heading(text: str) -> str:
+    return re.sub(r"^[^\w]+", "", text).strip()  # drop the leading emoji
+
+
+def _parse_kb(text: str) -> dict:
+    """Split the markdown into `# Topic › ## Question` sections."""
+    sections, topics = [], []
+    h1 = h2 = None
+    buf: list[str] = []
+
+    def flush():
+        body = "\n".join(buf).strip()
+        if not (body and h1) or "knowledgebase" in h1.lower() or h1.lower() == "summary":
+            return
+        title = f"{h1} › {h2}" if h2 else h1
+        sections.append({
+            "title": title,
+            "text": f"## {title}\n{body}",
+            "terms": Counter(_terms(f"{title}\n{body}")),
+            "head": set(_terms(title)),
+        })
+
+    for line in text.splitlines():
+        if line.startswith("# "):
+            flush(); buf = []
+            h1, h2 = _clean_heading(line[2:]), None
+            if "knowledgebase" not in h1.lower() and h1.lower() != "summary" and h1 not in topics:
+                topics.append(h1)
+        elif line.startswith("## "):
+            flush(); buf = []
+            h2 = _clean_heading(line[3:])
+        elif line.strip() != "---":
+            buf.append(line)
+    flush()
+
+    # The "What is Evalyn?" intro (links, what it is) goes in every prompt.
+    intro = next((s for s in sections if s["title"].lower().startswith("what is evalyn")), None)
+    rest = [s for s in sections if s is not intro]
+    return {
+        "intro": intro["text"] if intro else "",
+        "sections": rest,
+        "topics": ", ".join(t for t in topics if not t.lower().startswith("what is evalyn")),
+    }
+
+
+def _knowledge() -> dict | None:
+    """The parsed knowledge base, re-read only when the file changes."""
     try:
+        mtime = os.path.getmtime(KNOWLEDGE_FILE)
+    except OSError:
+        return None
+    if _KB_CACHE.get("mtime") != mtime:
         with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-            knowledge = f.read().strip()
-    except FileNotFoundError:
+            _KB_CACHE.clear()
+            _KB_CACHE.update(_parse_kb(f.read()), mtime=mtime)
+    return _KB_CACHE
+
+
+def _select_sections(sections: list[dict], query: str) -> list[dict]:
+    """The best-matching sections for the query, within the size budget, in file order."""
+    wanted = set(_terms(query, expand=True))
+    if not wanted or not sections:
+        return []
+    df = Counter(t for s in sections for t in s["terms"])
+    n = len(sections)
+    scored = []
+    for i, s in enumerate(sections):
+        score = 0.0
+        for t in wanted:
+            if t in s["terms"]:
+                idf = math.log(1 + n / df[t])
+                score += idf * (min(s["terms"][t], 3) + (3 if t in s["head"] else 0))
+        if score > 0:
+            scored.append((score, i))
+    if not scored:
+        return []
+    scored.sort(reverse=True)
+    floor = scored[0][0] * 0.25  # drop sections that only brushed one common word
+    chosen, used = [], 0
+    for score, i in scored:
+        if score < floor or len(chosen) >= KB_MAX_SECTIONS:
+            break
+        size = len(sections[i]["text"])
+        if used + size > KB_BUDGET_CHARS:
+            continue
+        chosen.append(i)
+        used += size
+    return [sections[i] for i in sorted(chosen)]
+
+
+def _build_system_prompt(base_url: str, account: str | None, query: str) -> str:
+    kb = _knowledge()
+    if kb is None:
         print(f"[ai_assistant] Knowledge base not found at {KNOWLEDGE_FILE}")
-        knowledge = "(No knowledge base found. Answer using general knowledge only.)"
+        knowledge, topics = "(No knowledge base found. Answer using general knowledge only.)", "nothing else"
+    else:
+        picked = _select_sections(kb["sections"], query)
+        knowledge = "\n\n".join([kb["intro"]] + [s["text"] for s in picked]).strip()
+        topics = kb["topics"] or "nothing else"
     return BASE_SYSTEM_PROMPT.format(
         base_url=base_url,
         account=account or NO_ACCOUNT_INFO,
+        topics=topics,
         knowledge=knowledge,
     )
+
+
+def _recent(history: list[dict], max_chars: int = HISTORY_CHARS) -> list[dict]:
+    """The latest messages that fit the budget (always at least the last one)."""
+    out, used = [], 0
+    for m in reversed(history):
+        used += len(m["content"])
+        if out and used > max_chars:
+            break
+        out.append(m)
+    return list(reversed(out))
+
+
+def _history_text(history: list[dict]) -> str:
+    return "\n".join(f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in _recent(history))
+
+
+def _clean_reply(text: str) -> str:
+    """Remove any <think>…</think> a reasoning model writes inline."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "<think>" in text:  # cut off mid-thought: nothing after it is an answer
+        text = text.split("<think>", 1)[0]
+    return text.strip()
 
 
 def _account_summary(data: dict | None) -> str | None:
@@ -197,6 +383,13 @@ class AIAssistant(commands.Cog):
         self.pending_close: dict[int, asyncio.Task] = {}
         # Evalyn account summary per thread: channel_id -> text
         self.account_context: dict[int, str] = {}
+        # Tickets already told the AI failed, so a dead Ollama posts one note, not one per message
+        self.failure_noted: set[int] = set()
+        # One Ollama request at a time. A CPU-only Ollama works through them one by one anyway,
+        # and a request waiting here doesn't count against the proxy's timeout like one queued there.
+        self._ollama_lock = asyncio.Semaphore(1)
+        # Ask models not to "think" first; dropped if the model doesn't understand the option.
+        self._send_think = True
 
     async def cog_load(self):
         await self._ensure_config()
@@ -279,6 +472,7 @@ class AIAssistant(commands.Cog):
         self.active_threads.pop(channel_id, None)
         self.claimed_threads.discard(channel_id)
         self.account_context.pop(channel_id, None)
+        self.failure_noted.discard(channel_id)
         if thread.recipient:
             self.user_to_channel.pop(thread.recipient.id, None)
         task = self.pending_close.pop(channel_id, None)
@@ -316,8 +510,8 @@ class AIAssistant(commands.Cog):
                         self.user_to_channel.pop(uid, None)
                         break
 
-                # Post a summary if there's any conversation history
-                if history:
+                # Post a summary if the AI actually said something
+                if any(m["role"] == "assistant" for m in history):
                     asyncio.create_task(self._post_summary(message.channel, history))
             return
 
@@ -382,30 +576,34 @@ class AIAssistant(commands.Cog):
         channel = thread.channel
         channel_id = channel.id
         history = self.active_threads.get(channel_id, [])
+        # Kept even if Ollama fails, so the next try and the handoff summary still see it
+        history.append({"role": "user", "content": user_message})
+        self.active_threads[channel_id] = history
 
         # --- Sentiment check before replying ---
-        sentiment = await self._check_sentiment(user_message)
+        sentiment, error = await self._check_sentiment(user_message)
+        if error:
+            # Ollama is down or stuck. The reply would fail the same way, so don't wait on it twice.
+            await self._report_failure(channel, error)
+            return
         print(f"[ai_assistant] Sentiment for channel {channel_id}: {sentiment}")
         if sentiment == "NEGATIVE":
             await self._escalate(thread, user_message)
             return
 
-        # Append the new user message to history
-        history.append({"role": "user", "content": user_message})
-
         async with channel.typing():
-            ai_reply = await self._call_ollama(history, self.account_context.get(channel_id))
-
-        if not ai_reply:
-            return
+            ai_reply, error = await self._call_ollama(history, self.account_context.get(channel_id))
 
         # A mod may have claimed the thread while Ollama was thinking
         if channel_id in self.claimed_threads:
             return
+        if error or not ai_reply:
+            await self._report_failure(channel, error or "The model sent back an empty reply.")
+            return
+        self.failure_noted.discard(channel_id)
 
         # Append AI reply to history for multi-turn context
         history.append({"role": "assistant", "content": ai_reply})
-        self.active_threads[channel_id] = history
 
         # 1. Send the reply to the user's DMs directly
         user_embed = discord.Embed(
@@ -435,15 +633,33 @@ class AIAssistant(commands.Cog):
             task = asyncio.create_task(self._schedule_auto_close(thread))
             self.pending_close[channel_id] = task
 
+    async def _report_failure(self, channel, error: str):
+        """Tell staff in the ticket why the AI said nothing. Once per ticket until it works again."""
+        print(f"[ai_assistant] Ollama failed in channel {channel.id}: {error}")
+        if channel.id in self.failure_noted:
+            return
+        self.failure_noted.add(channel.id)
+        embed = discord.Embed(
+            title="⚠️ AI couldn't answer",
+            description=(
+                f"{error}\n\n"
+                "The user hasn't been sent anything, so reply to them yourself. "
+                "`?ai_status` tests the AI server."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="Shown once per ticket. The AI tries again on the user's next message.")
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
     async def _post_summary(self, channel: discord.TextChannel, history: list[dict]):
         """Generate and post a handoff summary for the claiming mod."""
-        history_text = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
-        )
-        messages = [{"role": "user", "content": SUMMARY_PROMPT.format(history=history_text)}]
-        summary = await self._ollama_post(messages)
+        messages = [{"role": "user", "content": SUMMARY_PROMPT.format(history=_history_text(history))}]
+        summary, error = await self._ollama_post(messages, num_predict=300)
 
-        if not summary:
+        if error or not summary:
             return
 
         embed = discord.Embed(
@@ -568,100 +784,166 @@ class AIAssistant(commands.Cog):
         if len(user_messages) < 2:
             return False
 
-        history_text = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in history
-        )
-        messages = [{"role": "user", "content": RESOLUTION_PROMPT.format(history=history_text)}]
-        result = await self._ollama_post(messages)
-        if result is None:
+        messages = [{"role": "user", "content": RESOLUTION_PROMPT.format(history=_history_text(history))}]
+        result, error = await self._ollama_post(messages, num_predict=8)
+        if error or not result:
             return False  # Fail safe: don't auto-close if the check errors
 
         resolved = result.strip().upper().startswith("RESOLVED")
         print(f"[ai_assistant] Resolution Ollama result: '{result.strip()}' → resolved={resolved}")
         return resolved
 
-    async def _check_sentiment(self, message: str) -> str:
-        """Ask Ollama to classify sentiment. Returns NEGATIVE, NEUTRAL, or POSITIVE."""
+    async def _check_sentiment(self, message: str) -> tuple[str, str | None]:
+        """Classify sentiment: (NEGATIVE | NEUTRAL | POSITIVE, error if Ollama failed)."""
         messages = [{"role": "user", "content": SENTIMENT_PROMPT.format(message=message)}]
-        result = await self._ollama_post(messages)
-        if result is None:
-            return "NEUTRAL"  # Fail safe: don't block the AI on error
-        result = result.upper()
+        result, error = await self._ollama_post(messages, num_predict=8)
+        if error:
+            return "NEUTRAL", error
+        result = (result or "").upper()
         if "NEGATIVE" in result:
-            return "NEGATIVE"
+            return "NEGATIVE", None
         if "POSITIVE" in result:
-            return "POSITIVE"
-        return "NEUTRAL"
+            return "POSITIVE", None
+        return "NEUTRAL", None
 
-    async def _call_ollama(self, messages: list[dict], account: str | None = None) -> str | None:
-        """Send a chat completion request to Ollama and return the response text."""
+    async def _call_ollama(self, history: list[dict], account: str | None = None) -> tuple[str | None, str | None]:
+        """The reply to the conversation: system prompt with matching knowledge, plus recent history."""
         await self._ensure_config()
-        system = _load_system_prompt(self.evalyn_url, account)
-        full_messages = [{"role": "system", "content": system}] + messages
-        print(f"[ai_assistant] Calling Ollama at {self.ollama_url} with model {self.ollama_model}")
-        return await self._ollama_post(full_messages)
+        recent = _recent(history)
+        query = " ".join([m["content"] for m in recent if m["role"] == "user"][-2:])
+        system = _build_system_prompt(self.evalyn_url, account, query)
+        print(f"[ai_assistant] Calling Ollama at {self.ollama_url} with model {self.ollama_model} "
+              f"({len(system)} chars of system prompt)")
+        return await self._ollama_post([{"role": "system", "content": system}] + recent, num_predict=REPLY_TOKENS)
 
-    async def _ollama_post(self, messages: list[dict]) -> str | None:
-        """Shared Ollama HTTP caller with retry logic and extended timeout."""
+    async def _ollama_post(
+        self, messages: list[dict], *, num_predict: int | None = None,
+        timeout: int = OLLAMA_TIMEOUT, use_lock: bool = True,
+    ) -> tuple[str | None, str | None]:
+        """
+        Stream one chat request to Ollama. Returns (reply, None), or (None, why it failed).
+
+        Streamed because a proxy in front of Ollama cuts a request off after ~90s of
+        silence, and a non-streamed reply is silent until the last word is written.
+        """
         await self._ensure_config()
+        payload: dict = {"model": self.ollama_model, "messages": messages, "stream": True}
+        if num_predict:
+            payload["options"] = {"num_predict": num_predict}
+
+        lock = self._ollama_lock if use_lock else contextlib.nullcontext()
+        async with lock:
+            text, error, retry = await self._stream_chat(payload, timeout)
+            if retry:
+                # A proxy or Ollama restarting answers 502/503 or refuses the connection for a moment
+                print(f"[ai_assistant] {error} Retrying once.")
+                await asyncio.sleep(3)
+                text, error, _ = await self._stream_chat(payload, timeout)
+        return text, error
+
+    async def _stream_chat(self, payload: dict, timeout: int) -> tuple[str | None, str | None, bool]:
+        """One streamed POST /api/chat. Returns (reply, error, worth retrying)."""
         url = f"{self.ollama_url}/api/chat"
-        payload = {"model": self.ollama_model, "messages": messages, "stream": False}
+        body = dict(payload)
+        if self._send_think:
+            # Reasoning models (qwen3.x and others) would otherwise "think" for hundreds of tokens first
+            body["think"] = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout * 3, sock_read=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        detail = (await resp.text())[:300]
+                        if resp.status == 400 and "think" in body and "think" in detail.lower():
+                            self._send_think = False  # this model has no thinking switch; ask again without it
+                            return await self._stream_chat(payload, timeout)
+                        return None, self._describe_http(resp.status, detail), resp.status in (502, 503)
 
-        for attempt in range(1, OLLAMA_RETRIES + 2):  # +2 = initial try + retries
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url, json=payload, timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
-                    ) as resp:
-                        raw = await resp.text()
-                        if resp.status != 200:
-                            print(f"[ai_assistant] Ollama HTTP {resp.status}: {raw[:300]}")
-                            return None
-                        data = await resp.json(content_type=None)
-                        return data.get("message", {}).get("content", "").strip()
-            except (TimeoutError, asyncio.TimeoutError, aiohttp.ServerTimeoutError):
-                wait = 2 ** attempt
-                print(f"[ai_assistant] Timeout on attempt {attempt}/{OLLAMA_RETRIES + 1}, retrying in {wait}s")
-                if attempt <= OLLAMA_RETRIES:
-                    await asyncio.sleep(wait)
-            except aiohttp.ClientConnectorError as exc:
-                print(f"[ai_assistant] Connection error, could not reach {url}: {exc}")
-                return None
-            except Exception as exc:
-                import traceback
-                print(f"[ai_assistant] Unexpected error ({type(exc).__name__}): {exc}")
-                traceback.print_exc()
-                return None
+                    parts = []
+                    async for raw in resp.content:  # one JSON object per line
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except ValueError:
+                            continue
+                        if chunk.get("error"):
+                            return None, f"Ollama stopped with an error: {chunk['error']}", False
+                        parts.append((chunk.get("message") or {}).get("content") or "")
+                        if chunk.get("done"):
+                            break
+                    return _clean_reply("".join(parts)), None, False
+        except (asyncio.TimeoutError, TimeoutError):
+            return None, (
+                f"Ollama timed out (nothing for {timeout}s). It's stuck, overloaded, or too slow to answer."
+            ), False
+        except aiohttp.ClientConnectorError:
+            return None, f"Couldn't connect to Ollama at {self.ollama_url}.", True
+        except aiohttp.ClientError as exc:
+            return None, f"The connection to Ollama failed ({type(exc).__name__}).", True
+        except Exception as exc:
+            traceback.print_exc()
+            return None, f"Unexpected error talking to Ollama ({type(exc).__name__}: {exc}).", False
 
-        print(f"[ai_assistant] All {OLLAMA_RETRIES + 1} attempts timed out, giving up")
-        return None
+    def _describe_http(self, status: int, detail: str) -> str:
+        """An Ollama/proxy HTTP error, in words staff can act on."""
+        low = detail.lower()
+        if status == 404 and "not found" in low:
+            return (f"The Ollama server doesn't have the model `{self.ollama_model}`. "
+                    f"Pick one it has with `?ai_config ollama_model <name>`.")
+        if status in (504, 524):
+            return (f"The proxy in front of Ollama gave up waiting (HTTP {status}). "
+                    f"Ollama is stuck, overloaded, or too slow to answer.")
+        if status in (502, 503):
+            return f"Ollama isn't answering behind its proxy (HTTP {status}). It may be stopped or restarting."
+        if status in (401, 403):
+            return f"Ollama refused the request (HTTP {status}). Check the login or IP allowlist in front of it."
+        return f"Ollama returned HTTP {status}: {detail[:150]}"
 
     # ------------------------------------------------------------------
     # Admin commands
     # ------------------------------------------------------------------
 
     async def _probe_ollama(self) -> str:
-        """One line on whether Ollama answers and has the configured model."""
-        url = f"{self.ollama_url}/api/tags"
+        """Whether Ollama has the model and actually answers a test message."""
+        await self._ensure_config()
+        model = self.ollama_model
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.get(f"{self.ollama_url}/api/tags", timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         return f"⚠️ Ollama answered HTTP {resp.status} at {self.ollama_url}."
                     data = await resp.json(content_type=None)
         except Exception as exc:
             return f"⚠️ Couldn't reach Ollama at {self.ollama_url} ({type(exc).__name__})."
 
-        model = self.ollama_model
         names = set()
         for m in (data or {}).get("models", []):
             names.update(n for n in (m.get("name"), m.get("model")) if n)
-        if model in names or f"{model}:latest" in names:
-            return f"✅ Ollama is reachable and has `{model}`."
-        return (
-            f"⚠️ Ollama is reachable but doesn't have `{model}`. "
-            f"Run `ollama pull {model}` on the Ollama host, or pick another with `?ai_config ollama_model`."
+        if model not in names and f"{model}:latest" not in names:
+            return (
+                f"⚠️ Ollama is reachable but doesn't have `{model}`. "
+                f"Run `ollama pull {model}` on the Ollama host, or pick another with `?ai_config ollama_model`."
+            )
+
+        # Having the model isn't the same as answering. Send a real message.
+        busy = self._ollama_lock.locked()
+        started = time.monotonic()
+        text, error = await self._ollama_post(
+            [{"role": "user", "content": "Reply with the single word OK."}],
+            num_predict=5, timeout=60, use_lock=False,
         )
+        took = time.monotonic() - started
+        note = " The AI was answering a ticket at the same time, which slows this test." if busy else ""
+        if error:
+            return f"⚠️ Ollama has `{model}`, but a test message failed: {error}{note}"
+        if took > 30:
+            return (f"⚠️ Ollama answered a one-word test in {took:.0f}s. Real replies are much longer, "
+                    f"so expect slow answers or timeouts.{note}")
+        return f"✅ Ollama answered a test message in {took:.1f}s with `{model}`.{note}"
 
     def _display(self, key: str) -> str:
         if key == "escalation_role":
@@ -672,7 +954,7 @@ class AIAssistant(commands.Cog):
     @commands.command(name="ai_status")
     @commands.has_permissions(manage_guild=True)
     async def ai_status(self, ctx):
-        """Show which threads the AI is currently active in."""
+        """Show which threads the AI is active in, and test the AI server."""
         await self._ensure_config()
         active = len(self.active_threads)
         claimed = len(self.claimed_threads)
@@ -733,6 +1015,7 @@ class AIAssistant(commands.Cog):
             await self.db.find_one_and_update({"_id": "config"}, {"$set": {key: parsed}}, upsert=True)
 
         self._stored = None
+        self._send_think = True  # a different model may support the option again
         await self._ensure_config()
 
         lines = [f"✅ `{key}` is now {self._display(key)} ({self._source(key)})."]
@@ -759,7 +1042,7 @@ class AIAssistant(commands.Cog):
             return url, None
         if key == "ollama_model":
             if not re.match(r"^[\w.\-/:]+$", value):
-                return None, "Model names have no spaces, e.g. `gemma4:e2b` or `llama3`."
+                return None, "Model names have no spaces, e.g. `qwen3.5:4b` or `llama3`."
             return value, None
         if key == "escalation_role":
             if value.lower() in ("none", "off"):
