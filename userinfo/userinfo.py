@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -53,6 +54,15 @@ COLOUR_WARN  = 0xFEE75C   # yellow   – suspended / flags
 COLOUR_ERROR = 0xED4245   # red      – fetch failed
 
 DEFAULT_BASE_URL = "https://evalyn.tacogroup.uk"
+
+
+def _normalize_url(url: str | None) -> str:
+    """`evalyn.tacogroup.uk` and `<https://evalyn.tacogroup.uk/>` both become
+    `https://evalyn.tacogroup.uk`. Without a scheme aiohttp refuses the URL."""
+    url = (url or "").strip().strip("<>").strip().rstrip("/")
+    if url and not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    return url
 
 TIER_LABELS = {
     "master":   "🌟 Master",
@@ -74,6 +84,7 @@ ERROR_HINTS = {
     "missing_authorization": "No token was sent. Run `?userinfo setup`.",
     "rate_limited":          "Too many lookups this minute. Try again shortly.",
     "unreachable":           "Couldn't reach Evalyn. Check `EVALYN_BASE_URL` and the status page.",
+    "invalid_url":           "Run `?userinfo setup https://evalyn.tacogroup.uk <token>` with the full address.",
     "timeout":               "Evalyn took longer than 8 seconds to answer.",
 }
 
@@ -121,7 +132,7 @@ class UserInfo(commands.Cog):
     @property
     def base_url(self) -> str:
         stored = self._stored or {}
-        return (os.environ.get("EVALYN_BASE_URL") or stored.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        return _normalize_url(os.environ.get("EVALYN_BASE_URL") or stored.get("base_url") or DEFAULT_BASE_URL)
 
     @property
     def token(self) -> str:
@@ -177,6 +188,9 @@ class UserInfo(commands.Cog):
         except asyncio.TimeoutError:
             log.error("Timeout fetching %s", url)
             return {"_error": "timeout"}
+        except aiohttp.InvalidURL:
+            log.error("Invalid Evalyn URL: %s", url)
+            return {"_error": "invalid_url", "_message": f"`{self.base_url}` isn't a valid web address."}
         except aiohttp.ClientError as exc:
             log.error("HTTP error fetching %s: %s", url, exc)
             return {"_error": "unreachable", "_message": str(exc)}
@@ -409,7 +423,7 @@ class UserInfo(commands.Cog):
         except (discord.Forbidden, discord.NotFound):
             pass
 
-        await self._save_config(base_url=base_url.rstrip("/"), token=token)
+        await self._save_config(base_url=_normalize_url(base_url), token=token.strip())
 
         overridden = [k for k in ("EVALYN_BASE_URL", "EVALYN_SUPPORT_TOKEN") if os.environ.get(k)]
         probe = await self.lookup(discord_id=ctx.author.id)
